@@ -1,0 +1,48 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            name: windows-x64
+            ext: .exe
+          - os: macos-latest
+            name: macos-arm64
+            ext: ""
+          - os: ubuntu-latest
+            name: linux-x64
+            ext: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Linux deps
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev
+      - name: Test
+        run: cargo test --release --lib
+      - name: Build
+        run: cargo build --release --bins
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/blindmark${{ matrix.ext }} target/release/blindmark-cli${{ matrix.ext }} dist/
+          cp README.md dist/
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blindmark-${{ matrix.name }}
+          path: dist/
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
