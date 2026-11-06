@@ -23,12 +23,16 @@ const ID_LIST_REC: u16 = 1703;
 const ID_OUT: u16 = 1704;
 const ID_BROWSE: u16 = 1705;
 const ID_PER_DIR: u16 = 1706;
-const ID_STAMP: u16 = 1707;
+const ID_STAMP_INFO: u16 = 1707;
+const ID_NEW_NAME: u16 = 1713;
+const ID_ADD_REC: u16 = 1714;
+const ID_NEW_GROUP: u16 = 1715;
 const ID_STATUS: u16 = 1708;
 const ID_PROGRESS: u16 = 1709;
 const ID_LOG: u16 = 1710;
 const ID_START: u16 = 1711;
 const ID_CLOSE: u16 = 1712;
+const ID_LABEL_NAME: u16 = 1722;
 const ID_LABEL_OUT: u16 = 1720;
 
 const LVS_EX_CHECKBOXES: u32 = 0x0000_0004;
@@ -138,13 +142,21 @@ fn build(h: HWND) {
     create(windows_sys::core::w!("STATIC"), "输出文件夹", 0, 0, h, ID_LABEL_OUT);
     edit(h, ID_OUT, "");
     button(h, ID_BROWSE, "浏览…");
+    create(windows_sys::core::w!("STATIC"), "名称", 0, 0, h, ID_LABEL_NAME);
+    edit(h, ID_NEW_NAME, "");
+    button(h, ID_ADD_REC, "添加接收人");
+    button(h, ID_NEW_GROUP, "新建分组");
     checkbox(h, ID_PER_DIR, "按接收人分文件夹");
-    checkbox(h, ID_STAMP, "为本批次添加可信时间戳");
     set_check(ctl(h, ID_PER_DIR), true);
 
     if let Some(a) = app() {
-        set_check(ctl(h, ID_STAMP), a.cfg.timestamp);
         set_text(ctl(h, ID_OUT), &a.cfg.out_dir);
+        let stamp = if a.cfg.timestamp {
+            format!("时间戳：全局已启用（{}），在设置中修改", a.cfg.tsa_url)
+        } else {
+            "时间戳：全局已停用，在设置中修改".to_string()
+        };
+        create(windows_sys::core::w!("STATIC"), &stamp, 0, 0, h, ID_STAMP_INFO);
     }
 
     progress(h);
@@ -163,7 +175,7 @@ fn layout(h: HWND) {
     let col = (w - 3 * m) / 3;
     let mid = m + col + m;
     let right = m + 2 * (col + m);
-    let list_h = ht - top - sc(150);
+    let list_h = ht - top - sc(200);
 
     mv(ctl(h, ID_LABEL_IMG), m, m - sc(2), col, sc(18));
     mv(ctl(h, ID_LIST_IMG), m, top, col, list_h);
@@ -174,13 +186,83 @@ fn layout(h: HWND) {
     mv(ctl(h, ID_OUT), right, m + sc(18), col - sc(66), sc(24));
     mv(ctl(h, ID_BROWSE), right + col - sc(62), m + sc(16), sc(62), bh);
     mv(ctl(h, ID_PER_DIR), right, m + sc(50), col, sc(22));
-    mv(ctl(h, ID_STAMP), right, m + sc(76), col, sc(22));
-    mv(ctl(h, ID_STATUS), right, m + sc(104), col, sc(20));
+    mv(ctl(h, ID_STAMP_INFO), right, m + sc(78), col, sc(34));
+    mv(ctl(h, ID_STATUS), right, m + sc(116), col, sc(20));
+
+    let name_y = ht - sc(140);
+    mv(ctl(h, ID_LABEL_NAME), mid, name_y + sc(3), sc(34), sc(18));
+    mv(ctl(h, ID_NEW_NAME), mid + sc(38), name_y, col - sc(38), sc(24));
+    mv(ctl(h, ID_ADD_REC), mid, name_y + sc(30), (col - sc(6)) / 2, bh);
+    mv(ctl(h, ID_NEW_GROUP), mid + (col - sc(6)) / 2 + sc(6), name_y + sc(30), (col - sc(6)) / 2, bh);
 
     mv(ctl(h, ID_PROGRESS), m, ht - sc(104), w - 2 * m, sc(14));
     mv(ctl(h, ID_LOG), m, ht - sc(84), w - 2 * m - sc(230), sc(72));
     mv(ctl(h, ID_START), w - m - sc(110), ht - m - bh, sc(110), bh);
     mv(ctl(h, ID_CLOSE), w - m - sc(110) - sc(8) - sc(76), ht - m - bh, sc(76), bh);
+}
+
+fn current_group(h: HWND) -> Option<String> {
+    let a = app()?;
+    let sel = cb_sel(ctl(h, ID_GROUP));
+    if sel <= 0 {
+        return None;
+    }
+    Book::open(&a.cfg.registry_dir).ok().and_then(|b| b.groups.get(sel as usize - 1).map(|g| g.id.clone()))
+}
+
+fn add_recipient(h: HWND) {
+    let name = get_text(ctl(h, ID_NEW_NAME)).trim().to_string();
+    if name.is_empty() {
+        warn(h, "请先填写接收人姓名。");
+        return;
+    }
+    let Some(a) = app() else { return };
+    let gid = current_group(h);
+    let mut book = match Book::open(&a.cfg.registry_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            error(h, &format!("无法读取接收人名册：{e:#}"));
+            return;
+        }
+    };
+    match book.add_recipient(&name, gid.as_deref(), "") {
+        Ok(_) => {
+            set_text(ctl(h, ID_NEW_NAME), "");
+            fill_groups(h);
+            fill_recipients(h);
+        }
+        Err(e) => error(h, &format!("{e:#}")),
+    }
+}
+
+fn add_group(h: HWND) {
+    let name = get_text(ctl(h, ID_NEW_NAME)).trim().to_string();
+    if name.is_empty() {
+        warn(h, "请先填写分组名称。");
+        return;
+    }
+    let Some(a) = app() else { return };
+    let parent = current_group(h);
+    let mut book = match Book::open(&a.cfg.registry_dir) {
+        Ok(b) => b,
+        Err(e) => {
+            error(h, &format!("无法读取接收人名册：{e:#}"));
+            return;
+        }
+    };
+    // A selected top-level group becomes the parent; a selected child keeps the same parent.
+    let parent = parent.and_then(|p| match book.group(&p) {
+        Some(g) if g.parent.is_none() => Some(p),
+        _ => None,
+    });
+    match book.add_group(&name, parent.as_deref()) {
+        Ok(_) => {
+            set_text(ctl(h, ID_NEW_NAME), "");
+            fill_groups(h);
+            fill_recipients(h);
+        }
+        Err(e) => error(h, &format!("{e:#}")),
+    }
 }
 
 fn start(h: HWND) {
@@ -224,9 +306,8 @@ fn start(h: HWND) {
     let cfg = a.cfg.clone();
     let reg_dir = cfg.registry_dir.clone();
     let per_dir = checked(ctl(h, ID_PER_DIR));
-    let stamp = checked(ctl(h, ID_STAMP));
     let batch = format!("b_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"));
-    let tsa = if stamp { Some(cfg.tsa_url.clone()) } else { None };
+    let tsa = if cfg.timestamp { Some(cfg.tsa_url.clone()) } else { None };
 
     let (tx, rx) = channel();
     st().rx = Some(rx);
@@ -341,6 +422,8 @@ pub unsafe extern "system" fn proc_(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -
                         fill_recipients(h);
                     }
                 }
+                ID_ADD_REC => add_recipient(h),
+                ID_NEW_GROUP => add_group(h),
                 _ => {}
             }
             0

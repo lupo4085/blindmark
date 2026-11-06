@@ -46,6 +46,9 @@ pub struct SetPage {
     reg_path: HWND,
     reg_info: HWND,
     reg_btns: [HWND; 4],
+    stamp: HWND,
+    tsa_label: HWND,
+    tsa: HWND,
     // defaults
     l_strength: HWND,
     strength: HWND,
@@ -95,6 +98,9 @@ impl SetPage {
             button(p, REG_BACKUP, "备份…"),
             button(p, REG_CSV, "导出 CSV…"),
         ];
+        let stamp = checkbox(p, STAMP, "登记时添加可信时间戳（RFC 3161）");
+        let tsa_label = label(p, "时间戳服务");
+        let tsa = edit(p, TSA, "");
         let l_strength = label(p, "强度");
         let strength = trackbar(p, STRENGTH, 15, 40);
         let strength_val = label(p, "");
@@ -143,6 +149,9 @@ impl SetPage {
             reg_path,
             reg_info,
             reg_btns,
+            stamp,
+            tsa_label,
+            tsa,
             l_strength,
             strength,
             strength_val,
@@ -209,7 +218,8 @@ pub fn layout(a: &App, w: i32, _h: i32) {
     }
     y += gh + gap;
     // --- registry (left)
-    mv(s.groups[1], lx, y, col_w, gh);
+    let rgh = sc(176);
+    mv(s.groups[1], lx, y, col_w, rgh);
     mv(s.reg_path, lx + pad, y + sc(24), col_w - 2 * pad, sc(20));
     mv(s.reg_info, lx + pad, y + sc(44), col_w - 2 * pad, sc(20));
     let mut bx = lx + pad;
@@ -217,7 +227,10 @@ pub fn layout(a: &App, w: i32, _h: i32) {
         mv(*b, bx, y + sc(72), sc(bw), bh);
         bx += sc(bw) + sc(6);
     }
-    y += gh + gap;
+    mv(s.stamp, lx + pad, y + sc(108), col_w - 2 * pad, sc(22));
+    mv(s.tsa_label, lx + pad, y + sc(136), sc(64), sc(20));
+    mv(s.tsa, lx + pad + sc(70), y + sc(132), col_w - 2 * pad - sc(70), sc(24));
+    y += rgh + gap;
     // --- defaults (left)
     let dh = sc(196);
     mv(s.groups[2], lx, y, col_w, dh);
@@ -295,6 +308,8 @@ fn controls_from(a: &App, c: &Settings) {
     cb_set_sel(s.start_tab, if c.start_tab < 0 { 4 } else { c.start_tab.min(3) });
     set_check(s.remember, c.remember_window);
     set_check(s.autoclip, c.auto_clipboard);
+    set_check(s.stamp, c.timestamp);
+    set_text(s.tsa, &c.tsa_url);
 }
 
 /// Refresh every control from the saved settings and the loaded key / registry.
@@ -350,6 +365,12 @@ fn read_controls(a: &App) -> Result<Settings, String> {
     };
     c.remember_window = checked(s.remember);
     c.auto_clipboard = checked(s.autoclip);
+    c.timestamp = checked(s.stamp);
+    let tsa = get_text(s.tsa).trim().to_string();
+    if !tsa.is_empty() && !tsa.starts_with("http://") && !tsa.starts_with("https://") {
+        return Err("时间戳服务地址需要以 http:// 或 https:// 开头。".into());
+    }
+    c.tsa_url = if tsa.is_empty() { blindmark::timestamp::DEFAULT_TSA.to_string() } else { tsa };
     Ok(c)
 }
 
