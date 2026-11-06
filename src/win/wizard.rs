@@ -19,7 +19,6 @@ use std::sync::Arc;
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
-use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 use blindmark::keys;
@@ -112,6 +111,8 @@ struct State {
     rx: Option<Receiver<Msg>>,
     /// Watermark bitmap, painted by every page in WM_ERASEBKGND.
     bmp: HBITMAP,
+    /// Opaque background brush for labels.
+    white: HBRUSH,
 }
 
 thread_local! {
@@ -140,6 +141,7 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
         cancel: Arc::new(AtomicBool::new(false)),
         rx: None,
         bmp: null_mut(),
+        white: null_mut(),
     });
     let raw: *mut State = &mut *boxed;
     STATE.with(|c| c.set(raw));
@@ -155,7 +157,9 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
     ];
 
     let bmp = load_bitmap(BM_WATERMARK);
+    let white = unsafe { CreateSolidBrush(rgb(255, 255, 255)) };
     st().bmp = bmp;
+    st().white = white;
 
     let mut hdr: PROPSHEETHEADERW_V2 = unsafe { std::mem::zeroed() };
     hdr.dwSize = std::mem::size_of::<PROPSHEETHEADERW_V2>() as u32;
@@ -172,22 +176,16 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
     hdr.hplWatermark = null_mut();
     hdr.Anonymous5 = PROPSHEETHEADERW_V2_4 { hbmHeader: null_mut() };
 
-    // comctl32 builds the sheet frame and the pages under different DPI contexts when the
-    // process is PerMonitorV2: the page ends up 1.25x the frame and everything on the
-    // right is clipped. Running the sheet under a single system-DPI context keeps the two
-    // in step.
-    let saved_ctx = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
-    let saved_dpi = dpi();
-    set_dpi(unsafe { GetDpiForSystem() });
     let ret = unsafe { PropertySheetW(&mut hdr) };
-    set_dpi(saved_dpi);
-    unsafe { SetThreadDpiAwarenessContext(saved_ctx) };
 
     STATE.with(|c| c.set(null_mut()));
     let done = unsafe { Box::from_raw(raw) };
     unsafe {
         if !bmp.is_null() {
             DeleteObject(bmp as _);
+        }
+        if !white.is_null() {
+            DeleteObject(white as _);
         }
     }
 
@@ -237,26 +235,25 @@ fn page(id: i32, proc_: PageProc) -> PROPSHEETPAGEW {
 }
 
 // ------------------------------------------------------------------ painting
-
-fn rgb(r: u8, g: u8, b: u8) -> u32 {
-    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
-}
-
-/// The sheet keeps its classic size whatever the page template asks for, so the content
-/// is anchored to fixed offsets instead of the page width: comctl32 hands the page a
-/// width that is larger than the frame on 125-150 % scaling and anything past the frame
-/// is clipped.
+/// Content area to the right of the painted watermark strip.
 const CONTENT_X: i32 = 196;
-/// Visible height of a page inside the frame, in pixels.
-const PAGE_H: i32 = 330;
-const CONTENT_W: i32 = 300;
 
 fn content_x(_w: i32) -> i32 {
     CONTENT_X
 }
 
+const CONTENT_W: i32 = 300;
+/// Height of the visible page area, used to anchor the bottom row of each page.
+const PAGE_H: i32 = 330;
+
 fn content_w(_w: i32) -> i32 {
     CONTENT_W
+}
+
+// ------------------------------------------------------------------ painting
+
+fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
 unsafe fn fill(hdc: HDC, rc: &RECT, colour: u32) {
@@ -265,64 +262,51 @@ unsafe fn fill(hdc: HDC, rc: &RECT, colour: u32) {
     DeleteObject(br as _);
 }
 
-/// Paint the watermark strip plus an optional header title/subtitle.
+/// Paint the watermark strip plus the header title/subtitle of a page.
 unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
-    let (cw, ht) = avail_size(h);
+    let (cw, ht) = client_size(h);
     let all = RECT { left: 0, top: 0, right: cw, bottom: ht };
     fill(hdc, &all, rgb(255, 255, 255));
 
-    let s = st();
-    if !s.bmp.is_null() {
+    let bmp = st().bmp;
+    if !bmp.is_null() {
+        let strip = content_x(cw) - 8;
         let mem = CreateCompatibleDC(hdc);
-        let old = SelectObject(mem, s.bmp as _);
-        let strip = content_x(cw) - sc(6);
+        let old = SelectObject(mem, bmp as _);
         StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 164, 314, SRCCOPY);
         SelectObject(mem, old);
         DeleteDC(mem);
     }
 
-    let f = super::fonts();
-    let x = content_x(cw);
-    SetBkMode(hdc, TRANSPARENT as i32);
     if !title.is_empty() {
+        let f = super::fonts();
+        let x = content_x(cw);
+        SetBkMode(hdc, TRANSPARENT as i32);
         SelectObject(hdc, f.big as _);
         SetTextColor(hdc, rgb(28, 32, 36));
         let t = w(title);
-        TextOutW(hdc, x, sc(10), t.as_ptr(), (t.len() - 1) as i32);
+        TextOutW(hdc, x, 12, t.as_ptr(), (t.len() - 1) as i32);
         SelectObject(hdc, f.normal as _);
         SetTextColor(hdc, rgb(96, 104, 112));
         let t = w(subtitle);
-        TextOutW(hdc, x, sc(36), t.as_ptr(), (t.len() - 1) as i32);
-        let line = RECT { left: x, top: sc(HEADER_H), right: cw - sc(12), bottom: sc(HEADER_H) + 1 };
+        TextOutW(hdc, x, 42, t.as_ptr(), (t.len() - 1) as i32);
+        let line = RECT { left: x, top: 68, right: cw - 12, bottom: 69 };
         fill(hdc, &line, rgb(226, 230, 234));
     }
 }
 
-/// Transparent background for labels and checkboxes drawn over the painted banner.
+/// Opaque background for labels and checkboxes so glyphs are painted on a clean surface.
 unsafe fn on_ctlcolor(h: HWND, hdc: HDC, child: HWND, warn_id: u16) -> isize {
-    SetBkMode(hdc, TRANSPARENT as i32);
+    SetBkMode(hdc, OPAQUE as i32);
     if warn_id != 0 && child == ctl(h, warn_id) {
         SetTextColor(hdc, rgb(176, 0, 32));
+    } else {
+        SetTextColor(hdc, rgb(32, 36, 40));
     }
-    GetStockObject(HOLLOW_BRUSH) as isize
+    st().white as isize
 }
 
 // ------------------------------------------------------------------ helpers
-
-/// Usable area inside the wizard window. comctl32 sizes the page from the dialog
-/// template, which on 125-150 % scaling is wider than the sheet, so the layout is
-/// clamped to what the sheet actually shows.
-fn avail_size(h: HWND) -> (i32, i32) {
-    let (pw, ph) = client_size(h);
-    let root = unsafe { GetAncestor(h, GA_ROOT) };
-    if root.is_null() {
-        return (pw, ph);
-    }
-    let (rw, rh) = client_size(root);
-    let mut pt = POINT { x: 0, y: 0 };
-    unsafe { MapWindowPoints(h, root, &mut pt as *mut POINT, 1) };
-    ((rw - pt.x).min(pw), (rh - pt.y).min(ph))
-}
 
 fn ctl(h: HWND, id: u16) -> HWND {
     unsafe { GetDlgItem(h, id as i32) }
@@ -396,11 +380,11 @@ fn build_welcome(h: HWND) {
 }
 
 fn layout_welcome(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    mv(ctl(h, ID_WELCOME_TITLE), x, sc(20), cw, sc(34));
-    mv(ctl(h, ID_WELCOME_BODY), x, sc(62), cw, PAGE_H - sc(78));
+    mv(ctl(h, ID_WELCOME_TITLE), x, 76, cw, 34);
+    mv(ctl(h, ID_WELCOME_BODY), x, 118, cw, PAGE_H - 132);
 }
 
 unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -442,12 +426,12 @@ fn build_mode(h: HWND) {
 }
 
 fn layout_mode(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    mv(ctl(h, ID_EMBED), x, sc(70), cw, sc(26));
-    mv(ctl(h, ID_DETECT), x, sc(100), cw, sc(26));
-    mv(ctl(h, ID_MODE_HINT), x, PAGE_H - sc(30), cw, sc(20));
+    mv(ctl(h, ID_EMBED), x, 84, cw, 26);
+    mv(ctl(h, ID_DETECT), x, 118, cw, 26);
+    mv(ctl(h, ID_MODE_HINT), x, PAGE_H - 34, cw, 20);
 }
 
 unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
@@ -499,7 +483,8 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
 fn build_key(h: HWND) {
     let lv = listview(h, ID_KEY_TABLE, true);
     lv_column(lv, 0, "项目", 88, false);
-    lv_column(lv, 1, "内容", CONTENT_W - 88 - 24, false);
+    let (w, _) = client_size(h);
+    lv_column(lv, 1, "内容", CONTENT_W - 88 - 20, false);
     create(windows_sys::core::w!("BUTTON"), "创建新密钥…", (WS_TABSTOP | BS_DEFPUSHBUTTON as u32) as u32, 0, h, ID_KEY_NEW);
     button(h, ID_KEY_PICK, "使用已有的密钥文件…");
     button(h, ID_KEY_OPEN, "打开所在文件夹");
@@ -508,18 +493,18 @@ fn build_key(h: HWND) {
 }
 
 fn layout_key(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    let warn_y = PAGE_H - 48;
-    let row2 = warn_y - 36;
-    let row1 = row2 - 32;
-    mv(ctl(h, ID_KEY_TABLE), x, 60, cw, (row1 - 8 - 60).max(60));
-    mv(ctl(h, ID_KEY_NEW), x, row1, cw, 28);
-    let half = (cw - 8) / 2;
-    mv(ctl(h, ID_KEY_PICK), x, row2, half, 28);
-    mv(ctl(h, ID_KEY_OPEN), x + half + 8, row2, half, 28);
-    mv(ctl(h, ID_KEY_WARN), x, warn_y, cw, 36);
+    let warn_y = PAGE_H - 46;
+    let row2 = warn_y - 38;
+    let row1 = row2 - 36;
+    mv(ctl(h, ID_KEY_TABLE), x, 78, cw, (row1 - 12 - 78).max(80));
+    mv(ctl(h, ID_KEY_NEW), x, row1, cw, 30);
+    let half = (cw - 10) / 2;
+    mv(ctl(h, ID_KEY_PICK), x, row2, half, 30);
+    mv(ctl(h, ID_KEY_OPEN), x + half + 10, row2, half, 30);
+    mv(ctl(h, ID_KEY_WARN), x, warn_y, cw, 40);
 }
 
 /// Rows of the key table: file, fingerprint, registry and how many entries it holds.
@@ -670,11 +655,11 @@ fn build_files(h: HWND) {
 }
 
 fn layout_files(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    let by = PAGE_H - sc(34);
-    mv(ctl(h, ID_LIST), x, sc(66), cw, (by - sc(8) - sc(66)).max(sc(60)));
+    let by = PAGE_H - 46;
+    mv(ctl(h, ID_LIST), x, 78, cw, (by - 10 - 78).max(80));
     let bw = sc(104);
     mv(ctl(h, ID_ADD_FILES), x, by, bw, sc(28));
     mv(ctl(h, ID_ADD_FOLDER), x + bw + sc(8), by, bw + sc(18), sc(28));
@@ -791,11 +776,11 @@ fn build_embed(h: HWND) {
 }
 
 fn layout_embed(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
     let row = sc(30);
-    let mut y = sc(68);
+    let mut y = 82;
     mv(ctl(h, 1680), x, y + sc(6), sc(40), sc(18));
     mv(ctl(h, ID_STRENGTH), x + sc(44), y, cw - sc(100), row);
     mv(ctl(h, ID_STRENGTH_LABEL), x + cw - sc(52), y + sc(6), sc(52), sc(18));
@@ -892,10 +877,10 @@ fn build_detect(h: HWND) {
 }
 
 fn layout_detect(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    let mut y = sc(72);
+    let mut y = 86;
     for id in [ID_OPT_AFFINE, ID_OPT_PHOTO, ID_OPT_CONTENT, ID_OPT_STRICT] {
         mv(ctl(h, id), x, y, cw, sc(24));
         y += sc(30);
@@ -954,12 +939,12 @@ fn build_run(h: HWND) {
 }
 
 fn layout_run(h: HWND) {
-    let (w, _ht) = avail_size(h);
+    let (w, _ht) = client_size(h);
     let x = content_x(w);
     let cw = content_w(w);
-    mv(ctl(h, ID_PROGRESS), x, sc(70), cw, sc(16));
-    mv(ctl(h, ID_STATUS), x, sc(92), cw, sc(18));
-    mv(ctl(h, ID_RESULT), x, sc(114), cw, (PAGE_H - sc(114) - sc(12)).max(sc(50)));
+    mv(ctl(h, ID_PROGRESS), x, 80, cw, 16);
+    mv(ctl(h, ID_STATUS), x, 102, cw, 18);
+    mv(ctl(h, ID_RESULT), x, 126, cw, PAGE_H - 140);
 }
 
 fn start_run(h: HWND) {
