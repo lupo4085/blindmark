@@ -1,0 +1,40 @@
+name: alpha
+
+# Windows-only build for alpha tags (v*-alpha*). The stable `build` workflow skips
+# these tags and keeps producing the three-platform release for final versions.
+on:
+  push:
+    tags: ["v*-alpha*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Test
+        run: cargo test --release --lib
+      - name: Build
+        run: cargo build --release --bins
+      - name: Package
+        shell: bash
+        run: |
+          mkdir dist
+          cp target/release/blindmark.exe dist/
+          cp target/release/blindmark-cli.exe dist/
+          cp LICENSE-MIT LICENSE-APACHE README.md dist/
+          7z a "blindmark-windows-x64-alpha.zip" ./dist/*
+      - uses: actions/upload-artifact@v4
+        with:
+          name: blindmark-windows-x64-alpha
+          path: dist/
+      - name: Attach to release
+        uses: softprops/action-gh-release@v2
+        with:
+          prerelease: true
+          name: "BlindMark ${{ github.ref_name }} (alpha)"
+          files: blindmark-windows-x64-alpha.zip
