@@ -33,6 +33,8 @@ const REMEMBER: u16 = 1422;
 const AUTOCLIP: u16 = 1423;
 const DEFAULTS: u16 = 1424;
 const APPLY: u16 = 1425;
+const STAMP: u16 = 1428;
+const TSA: u16 = 1429;
 
 const THREAD_CHOICES: [usize; 7] = [0, 1, 2, 4, 8, 12, 16];
 
