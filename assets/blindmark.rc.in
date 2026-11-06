@@ -4,6 +4,71 @@
 1 ICON "@ICON@"
 1 24 "@MANIFEST@"
 
+301 BITMAP "@WM_BMP@"
+302 BITMAP "@HD_BMP@"
+
+/* Wizard97 pages, sized per the MSDN "Creating Wizards" guidance:
+     200             exterior (welcome): 317x193 dialog units, left 164 px reserved
+                     for the watermark, PSP_HIDEHEADER set in code
+     201..206        interior: 317x143, the header band is drawn by the sheet
+   The dialogs stay empty; src/win/wizard.rs builds the controls at run time so they
+   share the DPI and font handling of the tabbed window. */
+200 DIALOGEX 0, 0, 317, 193
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+201 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+202 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+203 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+204 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+205 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
+206 DIALOGEX 0, 0, 317, 143
+STYLE DS_SETFONT | WS_CHILD
+EXSTYLE WS_EX_CONTROLPARENT
+CAPTION "blindmark 向导"
+FONT 9, "MS Shell Dlg", 400, 0, 0x1
+BEGIN
+END
+
 1 VERSIONINFO
 FILEVERSION @VER_COMMA@
 PRODUCTVERSION @VER_COMMA@

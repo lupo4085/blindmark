@@ -33,6 +33,8 @@ fn main() {
             .unwrap()
             .replace("@ICON@", &fwd(root.join("assets/blindmark.ico")))
             .replace("@MANIFEST@", &fwd(root.join("assets/blindmark.manifest")))
+            .replace("@WM_BMP@", &fwd(root.join("assets/wizard-watermark.bmp")))
+            .replace("@HD_BMP@", &fwd(root.join("assets/wizard-header.bmp")))
             .replace("@VER_COMMA@", &comma)
             .replace("@VER@", &ver);
         // rc.exe takes one to four comma-separated 16-bit words here, and reports a fifth
