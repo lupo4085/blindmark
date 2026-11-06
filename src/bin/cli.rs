@@ -69,10 +69,11 @@ fn main() -> Result<()> {
             let k = read_key(&key)?;
             let reg = Registry::open(&registry).ok();
             let known = reg.as_ref().map(|r| wm::KnownIds::new(&k, r.ids()));
+            let thumbs = blindmark::registry::ThumbIndex::new();
             for inp in inputs {
                 let t = std::time::Instant::now();
                 let img = blindmark::registry::load_image(&inp)?;
-                let rep = blindmark::detect_image(&img, &k, reg.as_ref(), known.as_ref());
+                let rep = blindmark::detect_image(&img, &k, reg.as_ref(), known.as_ref(), Some(&thumbs));
                 let mut v = serde_json::to_value(&rep)?;
                 v["input"] = serde_json::json!(inp);
                 v["sec"] = serde_json::json!(t.elapsed().as_secs_f64());

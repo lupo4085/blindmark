@@ -380,7 +380,19 @@ def payload_matrix(key: bytes, ids) -> np.ndarray:
 
 
 def detect(rgb: np.ndarray, key: bytes, known_ids=None, z_thresh: float = 6.5,
-           extra_periods: list[float] | None = None) -> Detection:
+           extra_periods: list[float] | None = None, affine_fallback: bool = True) -> Detection:
+    """Fast axis-aligned path; if it does not identify the image, affine synchronisation
+    (rotation / mirror / aspect / shear, see affine.py) is tried and the better result kept."""
+    d = detect_axis(rgb, key, known_ids, z_thresh, extra_periods)
+    if d.found or not affine_fallback:
+        return d
+    import affine  # local import: affine.py imports this module
+    a = affine.detect_affine(rgb, key, known_ids, z_thresh)
+    return a if (a.found or a.z_sync > d.z_sync or np.isnan(d.z_sync)) else d
+
+
+def detect_axis(rgb: np.ndarray, key: bytes, known_ids=None, z_thresh: float = 6.5,
+                extra_periods: list[float] | None = None) -> Detection:
     """Blind detection. `known_ids` (IDs you issued, from the registry) enables
     maximum-likelihood ID decoding when blind CRC decoding fails."""
     y = rgb_to_ycbcr(rgb)[..., 0]
@@ -408,13 +420,16 @@ def detect(rgb: np.ndarray, key: bytes, known_ids=None, z_thresh: float = 6.5,
     z, soft, period = best
     if soft is None:
         return Detection(False, False, None, None, float("nan"), None, None)
-    present = z >= z_thresh
+    return _finish(z, soft, key, known_ids, z_thresh, period)
 
+
+def _finish(z, soft, key, known_ids, z_thresh, period):
+    """Decision step shared by all synchronisation paths."""
+    present = z >= z_thresh
     # 1) blind decode: hard bits -> decrypt -> CRC
     iid, ok = decode_payload(key, (soft > 0).astype(float))
     if present and ok:
         return Detection(True, True, iid, "crc", z, None, period)
-
     # 2) registry-assisted ML decode over issued IDs
     if present and known_ids is not None and len(known_ids):
         ids = list(known_ids)

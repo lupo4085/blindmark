@@ -5,6 +5,9 @@ on:
     tags: ["v*"]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   build:
     strategy:
@@ -24,9 +27,6 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - name: Linux deps
-        if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libxkbcommon-dev libwayland-dev libxrandr-dev libxi-dev libgl1-mesa-dev
       - name: Test
         run: cargo test --release --lib
       - name: Build
@@ -35,8 +35,16 @@ jobs:
         shell: bash
         run: |
           mkdir dist
-          cp target/release/blindmark${{ matrix.ext }} target/release/blindmark-cli${{ matrix.ext }} dist/
+          # The graphical app is Windows-only; other platforms ship the command-line tool.
+          if [ "${{ runner.os }}" = "Windows" ]; then cp target/release/blindmark.exe dist/; fi
+          cp target/release/blindmark-cli${{ matrix.ext }} dist/
+          cp LICENSE-MIT LICENSE-APACHE dist/
           cp README.md dist/
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            7z a "blindmark-${{ matrix.name }}.zip" ./dist/*
+          else
+            tar czf "blindmark-${{ matrix.name }}.tar.gz" -C dist .
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: blindmark-${{ matrix.name }}
@@ -45,4 +53,4 @@ jobs:
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/*
+          files: blindmark-${{ matrix.name }}.*

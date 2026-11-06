@@ -6,9 +6,10 @@ use rayon::prelude::*;
 
 pub const WORK_TILE: usize = 128; // detector tile size (2 px per chip)
 pub const MIN_PERIOD: f64 = 36.0; // smallest native period searched
-pub const MAX_TILES: f64 = 10.0; // per axis, when the detector upsamples
+pub const MAX_TILES: f64 = 10.0; // per axis, when the detector upsamples / for affine folding // per axis, when the detector upsamples
 pub const DEFAULT_STRENGTH: f32 = 2.6;
 pub const Z_THRESH: f64 = 6.5;
+pub const Z_THRESH_STRICT: f64 = 7.5;
 
 pub fn tile_size_for(h: usize, w: usize) -> usize {
     (2 * G).max((h.min(w) as f64 / 4.0).round() as usize)
@@ -86,20 +87,20 @@ pub fn embed_rgb(rgb: &mut [u8], w: usize, h: usize, key: &[u8], id: u32, streng
 
 // ------------------------------------------------------------------ detection
 
-fn highpass(y: &Plane, sigma: f64) -> Plane {
+pub(crate) fn highpass(y: &Plane, sigma: f64) -> Plane {
     let r = y.zip(&gaussian_blur(y, sigma), |a, b| a - b);
     let ls = local_std(&r, 15);
     r.zip(&ls, |a, s| a / (s + 1.0))
 }
 
-fn hann(n: usize) -> Vec<f64> {
+pub(crate) fn hann(n: usize) -> Vec<f64> {
     if n == 1 {
         return vec![1.0];
     }
     (0..n).map(|i| 0.5 - 0.5 * (2.0 * std::f64::consts::PI * i as f64 / (n - 1) as f64).cos()).collect()
 }
 
-fn median_filter_nearest(s: &[f64], size: usize) -> Vec<f64> {
+pub(crate) fn median_filter_nearest(s: &[f64], size: usize) -> Vec<f64> {
     let r = (size / 2) as isize;
     let n = s.len() as isize;
     (0..n)
@@ -111,7 +112,7 @@ fn median_filter_nearest(s: &[f64], size: usize) -> Vec<f64> {
         .collect()
 }
 
-fn roll2(src: &[f64], h: usize, w: usize, sy: usize, sx: usize) -> Vec<f64> {
+pub(crate) fn roll2(src: &[f64], h: usize, w: usize, sy: usize, sx: usize) -> Vec<f64> {
     let mut out = vec![0.0; h * w];
     for y in 0..h {
         for x in 0..w {
@@ -259,7 +260,7 @@ fn fold(res: &Plane, period_res: f64) -> Vec<f64> {
     standardize(f)
 }
 
-fn standardize(mut v: Vec<f64>) -> Vec<f64> {
+pub(crate) fn standardize(mut v: Vec<f64>) -> Vec<f64> {
     let n = v.len() as f64;
     let m = v.iter().sum::<f64>() / n;
     let sd = (v.iter().map(|x| (x - m) * (x - m)).sum::<f64>() / n).sqrt() + 1e-9;
@@ -296,7 +297,7 @@ impl SyncRef {
     }
 
     /// Align a folded tile to the sync template -> (z_sync, per-bit soft values).
-    fn analyse(&self, f: &[f64]) -> (f64, [f64; NBITS]) {
+    pub(crate) fn analyse(&self, f: &[f64]) -> (f64, [f64; NBITS]) {
         let n = WORK_TILE;
         let mut buf: Vec<C64> = f.iter().map(|&v| C64::new(v, 0.0)).collect();
         fft2(&mut buf, n, n, false);
@@ -352,6 +353,9 @@ pub struct Detection {
     pub z_sync: f64,
     pub z_id: Option<f64>,
     pub period_px: Option<f64>,
+    /// Lattice basis (native px per tile, columns = tile axes) when found by affine sync.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub basis: Option<[[f64; 2]; 2]>,
 }
 
 /// Expected +/-1 bit signs for issued IDs (rows of NBITS).
@@ -385,7 +389,22 @@ pub fn detect_rgb(rgb: &[u8], w: usize, h: usize, key: &[u8], known: Option<&Kno
     detect_luma(&y, key, known, Z_THRESH)
 }
 
+/// Fast axis-aligned path first; if it does not identify the image, affine synchronisation
+/// (rotation / mirror / aspect / shear) is tried and the better result is returned.
 pub fn detect_luma(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
+    let t = std::time::Instant::now();
+    let d = detect_axis(y, key, known, z_thresh);
+    if std::env::var_os("BLINDMARK_PROFILE").is_some() {
+        eprintln!("  axis path: {:.3}s (image {}x{})", t.elapsed().as_secs_f64(), y.w, y.h);
+    }
+    if d.found {
+        return d;
+    }
+    let a = crate::affine::detect_affine(y, key, known, z_thresh);
+    if a.found || a.z_sync > d.z_sync || d.z_sync.is_nan() { a } else { d }
+}
+
+pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
     let sref = SyncRef::new(key);
     let cands = estimate_periods(y);
     // coarse pass (parallel over candidates)
@@ -415,8 +434,13 @@ pub fn detect_luma(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
         })
         .collect();
     let Some((z, soft, period)) = fine.into_iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) else {
-        return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None };
+        return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None, basis: None };
     };
+    finish(z, &soft, period, key, known, z_thresh)
+}
+
+/// Decision step shared by all synchronisation paths: CRC decode, then registry ML decode.
+pub(crate) fn finish(z: f64, soft: &[f64; NBITS], period: f64, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
     let present = z >= z_thresh;
     let mut bits = [0u8; NBITS];
     for i in 0..NBITS {
@@ -424,21 +448,21 @@ pub fn detect_luma(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
     }
     let (id, ok) = keys::decode_payload(key, &bits);
     if present && ok {
-        return Detection { found: true, present, image_id: Some(id), method: Some("crc".into()), z_sync: z, z_id: None, period_px: Some(period) };
+        return Detection { found: true, present, image_id: Some(id), method: Some("crc".into()), z_sync: z, z_id: None, period_px: Some(period), basis: None };
     }
     if present {
         if let Some(k) = known.filter(|k| !k.ids.is_empty()) {
-            let scores: Vec<f64> = k.rows.iter().map(|r| r.iter().zip(&soft).map(|(&s, &v)| s as f64 * v).sum()).collect();
+            let scores: Vec<f64> = k.rows.iter().map(|r| r.iter().zip(soft).map(|(&s, &v)| s as f64 * v).sum()).collect();
             let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
             let thr = norm_isf(1e-6 / k.ids.len() as f64).max(5.0);
-            let hamming = k.rows[j].iter().zip(&soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count();
+            let hamming = k.rows[j].iter().zip(soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count();
             if best >= thr && hamming <= NBITS / 3 {
-                return Detection { found: true, present, image_id: Some(k.ids[j]), method: Some("registry".into()), z_sync: z, z_id: Some(best), period_px: Some(period) };
+                return Detection { found: true, present, image_id: Some(k.ids[j]), method: Some("registry".into()), z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
             }
-            return Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: Some(best), period_px: Some(period) };
+            return Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
         }
     }
-    Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: None, period_px: Some(period) }
+    Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: None, period_px: Some(period), basis: None }
 }
 
 /// Inverse survival function of N(0,1) (Acklam's rational approximation).
@@ -500,6 +524,20 @@ mod tests {
         let c = resize(&c, 280, 210);
         let d = detect_luma(&c, &key, Some(&KnownIds::new(&key, vec![1, 2, 0xC0FFEE, 3])), Z_THRESH);
         assert!(d.found && d.image_id == Some(0xC0FFEE), "{d:?}");
+        // rotation by 30 degrees and a mirror flip (affine synchronisation)
+        let t = 30f64.to_radians();
+        let m: imgproc::Mat2 = [[t.cos(), t.sin()], [-t.sin(), t.cos()]]; // canvas -> source (inverse rotation)
+        let fwd = imgproc::mat_inv(&m).unwrap();
+        let (origin, cw, ch) = imgproc::warped_bounds(w, h, &fwd);
+        let (r, _) = imgproc::sample_linear(&y, &m, origin, cw, ch);
+        let d = detect_luma(&r, &key, Some(&KnownIds::new(&key, vec![7, 0xC0FFEE])), Z_THRESH);
+        assert!(d.found && d.image_id == Some(0xC0FFEE) && d.basis.is_some(), "rotated: {d:?}");
+        let mut mir = y.clone();
+        for row in mir.d.chunks_mut(w) {
+            row.reverse();
+        }
+        let d = detect_luma(&mir, &key, None, Z_THRESH);
+        assert!(d.found && d.image_id == Some(0xC0FFEE), "mirrored: {d:?}");
         // wrong key / unmarked image must not be detected
         let d = detect_rgb(&img, w, h, b"another-key-0123456789abcdefgh!!", None);
         assert!(!d.present, "{d:?}");

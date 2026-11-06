@@ -131,6 +131,67 @@ impl Registry {
     pub fn thumb_path(&self, e: &Entry) -> PathBuf {
         self.dir.join(&e.thumb)
     }
+
+    /// Change (or clear) the channel note of an entry.
+    pub fn set_channel(&mut self, id: u32, channel: Option<String>) -> Result<()> {
+        let e = self.entries.get_mut(&id.to_string()).context("no such entry")?;
+        e.channel = channel.filter(|c| !c.trim().is_empty()).map(|c| c.trim().to_string());
+        self.save()
+    }
+
+    /// Distinct channel notes, most used first.
+    pub fn channels(&self) -> Vec<String> {
+        let mut m: BTreeMap<String, usize> = BTreeMap::new();
+        for e in self.entries.values() {
+            if let Some(c) = &e.channel {
+                *m.entry(c.clone()).or_default() += 1;
+            }
+        }
+        let mut v: Vec<(String, usize)> = m.into_iter().collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1).then(a.0.cmp(&b.0)));
+        v.into_iter().map(|(c, _)| c).collect()
+    }
+
+    /// Export all entries as CSV (UTF-8 with BOM so Excel opens it correctly).
+    pub fn export_csv(&self, path: &Path) -> Result<()> {
+        fn q(s: &str) -> String {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        }
+        let mut out = String::from("\u{feff}id,source,channel,registered_utc,width,height,strength,sha256_original,sha256_marked,output\r\n");
+        for (k, e) in &self.entries {
+            let id = k.parse::<u32>().map(|i| format!("0x{i:08x}")).unwrap_or_else(|_| k.clone());
+            out += &[
+                q(&id),
+                q(&e.source),
+                q(e.channel.as_deref().unwrap_or("")),
+                q(&e.registered_utc),
+                e.size[1].to_string(),
+                e.size[0].to_string(),
+                e.strength.map(|s| format!("{s:.1}")).unwrap_or_default(),
+                q(&e.sha256_original),
+                q(&e.sha256_marked),
+                q(e.output.as_deref().unwrap_or("")),
+            ]
+            .join(",");
+            out += "\r\n";
+        }
+        std::fs::write(path, out)?;
+        Ok(())
+    }
+
+    /// Copy the whole registry folder into `dest/blindmark-registry-backup-<timestamp>`.
+    pub fn backup_to(&self, dest: &Path) -> Result<PathBuf> {
+        let stamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+        let target = dest.join(format!("blindmark-registry-backup-{stamp}"));
+        std::fs::create_dir_all(&target)?;
+        for entry in std::fs::read_dir(&self.dir)? {
+            let entry = entry?;
+            if entry.file_type()?.is_file() {
+                std::fs::copy(entry.path(), target.join(entry.file_name()))?;
+            }
+        }
+        Ok(target)
+    }
 }
 
 // ------------------------------------------------------------------ images
@@ -320,31 +381,212 @@ fn overlap_corr(s: &Plane, t: &Plane, dy: isize, dx: isize) -> (f64, f64) {
     (cors[cors.len() / 2], overlap)
 }
 
-pub fn content_match(reg: &Registry, id: u32, suspect: &RgbImageBuf, period_px: f64) -> Option<ContentMatch> {
+/// The 8 signed permutation matrices (symmetries of the square tile).
+fn d4_mats() -> Vec<imgproc::Mat2> {
+    let mut v = vec![];
+    for k in 0..4 {
+        let r = imgproc::rot(k as f64 * std::f64::consts::FRAC_PI_2);
+        let r = [[r[0][0].round(), r[0][1].round()], [r[1][0].round(), r[1][1].round()]];
+        v.push(r);
+        v.push(imgproc::mat_mul(&r, &[[1.0, 0.0], [0.0, -1.0]]));
+    }
+    v
+}
+
+/// Warp the suspect's luma into the thumbnail frame through `l` (original px -> suspect px)
+/// and `ts` (thumbnail px per original px). Invalid area is filled with the mean (flat).
+fn to_thumb_frame(sy: &Plane, l: &imgproc::Mat2, ts: f64) -> Option<Plane> {
+    let fwd = imgproc::mat_scale(&imgproc::mat_inv(l)?, ts); // suspect px -> thumb px
+    let shrink = imgproc::mat_det(&fwd).abs().sqrt();
+    let (src, pre) = if shrink < 0.9 {
+        let p = resize(sy, ((sy.w as f64 * shrink).round() as usize).max(8), ((sy.h as f64 * shrink).round() as usize).max(8));
+        let k = (p.w as f64 / sy.w as f64, p.h as f64 / sy.h as f64);
+        (p, k)
+    } else {
+        (sy.clone(), (1.0, 1.0))
+    };
+    let fwd2 = [[fwd[0][0] / pre.0, fwd[0][1] / pre.1], [fwd[1][0] / pre.0, fwd[1][1] / pre.1]];
+    let back = imgproc::mat_inv(&fwd2)?;
+    let (origin, cw, ch) = imgproc::warped_bounds(src.w, src.h, &fwd2);
+    if cw < 16 || ch < 16 || cw * ch > 3000 * 3000 {
+        return None;
+    }
+    let (mut can, valid) = imgproc::sample_linear(&src, &back, origin, cw, ch);
+    let (mut s, mut n) = (0f64, 0f64);
+    for (v, &ok) in can.d.iter().zip(&valid) {
+        if ok == 1 {
+            s += *v as f64;
+            n += 1.0;
+        }
+    }
+    let m = if n > 0.0 { (s / n) as f32 } else { 0.0 };
+    for (v, &ok) in can.d.iter_mut().zip(&valid) {
+        if ok == 0 {
+            *v = m;
+        }
+    }
+    Some(can)
+}
+
+/// Similarity between a suspect image and the registered thumbnail. The watermark lattice
+/// (`det.basis`, or the axis period) gives scale and rotation up to the 8 tile symmetries,
+/// which are resolved by phase-correlation strength; the score is the median block
+/// correlation of lightly blurred luminance over the overlap (flat UI areas are skipped).
+pub fn content_match(reg: &Registry, id: u32, suspect: &RgbImageBuf, det: &wm::Detection) -> Option<ContentMatch> {
     let e = reg.get(id)?;
     let th = load_image(&reg.thumb_path(e)).ok()?;
     let tile = e.tile_px.unwrap_or_else(|| wm::tile_size_for(e.size[0], e.size[1])) as f64;
-    let scale = period_px / tile; // suspect px per original px
-    let base = th.w as f64 / e.size[1] as f64 / scale;
+    let b = det.basis.or(det.period_px.map(|p| [[p, 0.0], [0.0, p]]))?;
+    let ts = th.w as f64 / e.size[1] as f64;
     let sy = imgproc::luma(&suspect.data, suspect.w, suspect.h);
     let t = gaussian_blur(&imgproc::luma(&th.data, th.w, th.h), 1.0);
     let bp = |p: &Plane| p.zip(&gaussian_blur(p, 4.0), |a, b| a - b);
     let tb = bp(&t);
-    let mut best: Option<(f64, f64, Plane, isize, isize)> = None; // (peak, factor, s, dy, dx)
-    for i in -4..=4 {
-        let f = base * (1.0 + 0.008 * i as f64);
-        let (nw, nh) = ((sy.w as f64 * f).round() as usize, (sy.h as f64 * f).round() as usize);
-        if nw < 16 || nh < 16 {
-            continue;
-        }
-        let s = gaussian_blur(&resize(&sy, nw, nh), 1.0);
-        let (dy, dx, peak) = phase_corr(&tb, &hann_taper(&bp(&s)));
-        if best.as_ref().is_none_or(|b| peak > b.0) {
-            best = Some((peak, f, s, dy, dx));
+    // 1) orientation at half resolution
+    let half = |p: &Plane| resize(p, (p.w / 2).max(8), (p.h / 2).max(8));
+    let tb_half = bp(&half(&t));
+    let mut orient: Option<(f64, imgproc::Mat2)> = None;
+    for s in d4_mats() {
+        let l = imgproc::mat_scale(&imgproc::mat_mul(&b, &s), 1.0 / tile);
+        let Some(c) = to_thumb_frame(&sy, &l, ts * 0.5) else { continue };
+        let c = gaussian_blur(&c, 1.0);
+        let (_, _, peak) = phase_corr(&tb_half, &hann_taper(&bp(&c)));
+        if orient.as_ref().is_none_or(|o| peak > o.0) {
+            orient = Some((peak, l));
         }
     }
-    let (_, _, s, dy, dx) = best?;
-    // small residual misalignment is tolerated by comparing lightly blurred luminance
+    let (_, l0) = orient?;
+    // 2) scale refinement + offset at full thumbnail resolution
+    let mut best: Option<(f64, Plane, isize, isize)> = None;
+    for i in -3..=3 {
+        let l = imgproc::mat_scale(&l0, 1.0 + 0.01 * i as f64);
+        let Some(c) = to_thumb_frame(&sy, &l, ts) else { continue };
+        let s = gaussian_blur(&c, 1.0);
+        let (dy, dx, peak) = phase_corr(&tb, &hann_taper(&bp(&s)));
+        if best.as_ref().is_none_or(|b| peak > b.0) {
+            best = Some((peak, s, dy, dx));
+        }
+    }
+    let (_, s, dy, dx) = best?;
     let (sim, overlap) = overlap_corr(&gaussian_blur(&s, 1.5), &gaussian_blur(&t, 1.5), dy, dx);
     Some(ContentMatch { similarity: sim, overlap })
+}
+
+// ------------------------------------------------------------------ registry-assisted geometry
+
+/// ORB features of every registered thumbnail, computed lazily once.
+#[derive(Default)]
+pub struct ThumbIndex {
+    cell: std::sync::OnceLock<Vec<(u32, crate::features::Features, usize, usize)>>,
+}
+
+impl ThumbIndex {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    fn get(&self, reg: &Registry) -> &[(u32, crate::features::Features, usize, usize)] {
+        self.cell.get_or_init(|| {
+            use rayon::prelude::*;
+            let items: Vec<(u32, PathBuf)> = reg.entries.iter().filter_map(|(k, e)| k.parse().ok().map(|id| (id, reg.thumb_path(e)))).collect();
+            items
+                .par_iter()
+                .filter_map(|(id, p)| {
+                    let im = load_image(p).ok()?;
+                    let g = imgproc::luma(&im.data, im.w, im.h);
+                    Some((*id, crate::features::orb(&g, 1200), im.w, im.h))
+                })
+                .collect()
+        })
+    }
+}
+
+pub struct Located {
+    pub entry: u32,
+    pub h: crate::features::Homography, // thumbnail px -> suspect px
+    pub inliers: usize,
+}
+
+/// Find which registered picture appears in `suspect` and the perspective mapping to it.
+pub fn locate(reg: &Registry, index: &ThumbIndex, suspect_gray: &Plane) -> Option<Located> {
+    use crate::features::{match_features, orb, ransac_homography};
+    let sf = orb(suspect_gray, 3000);
+    let mut best: Option<Located> = None;
+    for (id, tf, _, _) in index.get(reg) {
+        let m = match_features(tf, &sf);
+        if m.len() < 12 {
+            continue;
+        }
+        let src: Vec<(f64, f64)> = m.iter().map(|&(i, _)| (tf.pts[i].0 as f64, tf.pts[i].1 as f64)).collect();
+        let dst: Vec<(f64, f64)> = m.iter().map(|&(_, j)| (sf.pts[j].0 as f64, sf.pts[j].1 as f64)).collect();
+        let tol = (suspect_gray.w.max(suspect_gray.h) as f64 / 400.0).max(3.0);
+        if let Some((h, n)) = ransac_homography(&src, &dst, tol, 1500) {
+            let ok = n >= 15 && n as f64 >= 0.2 * m.len() as f64;
+            if ok && best.as_ref().is_none_or(|b| n > b.inliers) {
+                best = Some(Located { entry: *id, h, inliers: n });
+            }
+        }
+    }
+    best
+}
+
+/// Pull the suspect back into the registered picture's frame (at about the suspect's own
+/// resolution, never larger than the original). Returns the rectified luma.
+pub fn rectify(reg: &Registry, loc: &Located, suspect_gray: &Plane) -> Option<Plane> {
+    use crate::features::apply_h;
+    let e = reg.get(loc.entry)?;
+    let th = image::image_dimensions(reg.thumb_path(e)).ok()?;
+    let (ow, oh) = (e.size[1] as f64, e.size[0] as f64);
+    let ts = th.0 as f64 / ow; // thumb px per original px
+    // local scale of H at the thumbnail centre (suspect px per thumb px)
+    let (cx, cy) = (th.0 as f64 / 2.0, th.1 as f64 / 2.0);
+    let p0 = apply_h(&loc.h, cx, cy);
+    let px = apply_h(&loc.h, cx + 1.0, cy);
+    let py = apply_h(&loc.h, cx, cy + 1.0);
+    let det = ((px.0 - p0.0) * (py.1 - p0.1) - (px.1 - p0.1) * (py.0 - p0.0)).abs();
+    let s_r = (det.sqrt() * ts).min(1.0); // rectified px per original px
+    let (rw, rh) = ((ow * s_r).round() as usize, (oh * s_r).round() as usize);
+    if rw < 64 || rh < 64 {
+        return None;
+    }
+    let mut out = Plane::new(rw, rh);
+    let mut valid = vec![false; rw * rh];
+    let (sw, sh) = ((suspect_gray.w - 1) as f64, (suspect_gray.h - 1) as f64);
+    {
+        use rayon::prelude::*;
+        out.d.par_chunks_mut(rw).zip(valid.par_chunks_mut(rw)).enumerate().for_each(|(v, (row, vrow))| {
+            for u in 0..rw {
+                let xt = (u as f64 + 0.5) / s_r * ts - 0.5;
+                let yt = (v as f64 + 0.5) / s_r * ts - 0.5;
+                let (x, y) = apply_h(&loc.h, xt, yt);
+                if x >= 0.0 && x <= sw && y >= 0.0 && y <= sh {
+                    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+                    let (x1, y1) = ((x0 + 1).min(suspect_gray.w - 1), (y0 + 1).min(suspect_gray.h - 1));
+                    let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+                    let g = |xx: usize, yy: usize| suspect_gray.d[yy * suspect_gray.w + xx];
+                    row[u] = (g(x0, y0) * (1.0 - fx) + g(x1, y0) * fx) * (1.0 - fy) + (g(x0, y1) * (1.0 - fx) + g(x1, y1) * fx) * fy;
+                    vrow[u] = true;
+                }
+            }
+        });
+    }
+    let n = valid.iter().filter(|&&v| v).count();
+    if n < rw * rh / 5 {
+        return None;
+    }
+    let mean = out.d.iter().zip(&valid).filter(|p| *p.1).map(|p| *p.0 as f64).sum::<f64>() / n as f64;
+    for (x, &v) in out.d.iter_mut().zip(&valid) {
+        if !v {
+            *x = mean as f32;
+        }
+    }
+    Some(out)
+}
+
+/// Content similarity of a rectified (already registered) image against its thumbnail.
+pub fn rectified_similarity(reg: &Registry, id: u32, rect: &Plane) -> Option<f64> {
+    let e = reg.get(id)?;
+    let th = load_image(&reg.thumb_path(e)).ok()?;
+    let t = gaussian_blur(&imgproc::luma(&th.data, th.w, th.h), 1.5);
+    let s = gaussian_blur(&resize(rect, th.w, th.h), 1.5);
+    Some(overlap_corr(&s, &t, 0, 0).0)
 }

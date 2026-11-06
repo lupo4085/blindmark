@@ -14,7 +14,17 @@ fn main() {
         let full = dir.join(p).display().to_string();
         let (tag, att) = tags.get(&full).cloned().unwrap_or_default();
         let img = load_image(&dir.join(p)).unwrap();
-        let cm = content_match(&reg, r["image_id"].as_u64().unwrap() as u32, &img, r["period_px"].as_f64().unwrap());
+        let det = blindmark::wm::Detection {
+            found: true,
+            present: true,
+            image_id: r["image_id"].as_u64().map(|v| v as u32),
+            method: None,
+            z_sync: r["z_sync"].as_f64().unwrap_or(0.0),
+            z_id: None,
+            period_px: r["period_px"].as_f64(),
+            basis: serde_json::from_value(r["basis"].clone()).ok(),
+        };
+        let cm = content_match(&reg, r["image_id"].as_u64().unwrap() as u32, &img, &det);
         if let Some(cm) = cm { println!("{tag}\t{att}\t{:.3}\t{:.2}", cm.similarity, cm.overlap); }
     }
 }

@@ -1,25 +1,30 @@
 [package]
 name = "blindmark"
-version = "0.1.0"
+version = "0.2.0"
+license = "MIT OR Apache-2.0"
+description = "Keyed, content-adaptive, screenshot-tolerant blind image watermark"
+authors = ["Lupo"]
 edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-arboard = "3.7.0"
 chrono = "0.4.45"
 clap = { version = "4.6.7", features = ["derive"] }
 dirs = "7.0.0"
-eframe = { version = "0.37.0", default-features = false, features = ["glow", "x11", "wayland", "default_fonts", "system_fonts", "accesskit", "clipboard"] }
 getrandom = "0.4.3"
 hex = "0.4.3"
 hmac = "0.13.0"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp", "bmp", "tiff", "gif", "rayon"] }
 rayon = "1.12.0"
-rfd = "0.17.2"
 rustfft = "6.4.1"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 sha2 = "0.11.1"
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging", "Win32_UI_Controls", "Win32_UI_Controls_Dialogs", "Win32_Graphics_Gdi", "Win32_System_LibraryLoader", "Win32_UI_Shell", "Win32_UI_Shell_Common", "Win32_System_DataExchange", "Win32_System_Ole", "Win32_System_Memory", "Win32_UI_HiDpi", "Win32_UI_Input_KeyboardAndMouse", "Win32_System_Com", "Win32_System_SystemServices"] }
+
+[features]
+# Type-check the Win32 GUI on non-Windows hosts: cargo check --features win32-check
+win32-check = []
 
 [[bin]]
 name = "blindmark"
@@ -37,3 +42,7 @@ strip = true
 
 [profile.dev]
 opt-level = 2
+
+[build-dependencies]
+chrono = "0.4.45"
+embed-resource = "3"

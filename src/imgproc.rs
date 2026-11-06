@@ -248,3 +248,135 @@ pub fn luma(rgb: &[u8], w: usize, h: usize) -> Plane {
         .collect();
     Plane::from_vec(w, h, d)
 }
+
+// ---------------------------------------------------------------- linear warps
+
+/// 2x2 matrix, row-major: [[a, b], [c, d]] maps (x, y) -> (a x + b y, c x + d y).
+pub type Mat2 = [[f64; 2]; 2];
+
+pub fn mat_mul(a: &Mat2, b: &Mat2) -> Mat2 {
+    [
+        [a[0][0] * b[0][0] + a[0][1] * b[1][0], a[0][0] * b[0][1] + a[0][1] * b[1][1]],
+        [a[1][0] * b[0][0] + a[1][1] * b[1][0], a[1][0] * b[0][1] + a[1][1] * b[1][1]],
+    ]
+}
+
+pub fn mat_det(a: &Mat2) -> f64 {
+    a[0][0] * a[1][1] - a[0][1] * a[1][0]
+}
+
+pub fn mat_inv(a: &Mat2) -> Option<Mat2> {
+    let d = mat_det(a);
+    if d.abs() < 1e-12 {
+        return None;
+    }
+    Some([[a[1][1] / d, -a[0][1] / d], [-a[1][0] / d, a[0][0] / d]])
+}
+
+pub fn mat_scale(a: &Mat2, s: f64) -> Mat2 {
+    [[a[0][0] * s, a[0][1] * s], [a[1][0] * s, a[1][1] * s]]
+}
+
+pub fn rot(t: f64) -> Mat2 {
+    [[t.cos(), -t.sin()], [t.sin(), t.cos()]]
+}
+
+#[inline]
+fn bilinear(p: &Plane, x: f64, y: f64) -> f32 {
+    let x = x.clamp(0.0, (p.w - 1) as f64);
+    let y = y.clamp(0.0, (p.h - 1) as f64);
+    let (x0, y0) = (x.floor() as usize, y.floor() as usize);
+    let (x1, y1) = ((x0 + 1).min(p.w - 1), (y0 + 1).min(p.h - 1));
+    let (fx, fy) = ((x - x0 as f64) as f32, (y - y0 as f64) as f32);
+    let a = p.d[y0 * p.w + x0] * (1.0 - fx) + p.d[y0 * p.w + x1] * fx;
+    let b = p.d[y1 * p.w + x0] * (1.0 - fx) + p.d[y1 * p.w + x1] * fx;
+    a * (1.0 - fy) + b * fy
+}
+
+/// Resample `src` onto a canvas through a linear map `m`: canvas pixel (u, v), offset by
+/// `origin`, samples source pixel m · (u + origin_x, v + origin_y). Returns the canvas and
+/// a validity mask (1 where the sample fell inside the source).
+pub fn sample_linear(src: &Plane, m: &Mat2, origin: (f64, f64), cw: usize, ch: usize) -> (Plane, Vec<u8>) {
+    let mut out = Plane::new(cw, ch);
+    let mut mask = vec![0u8; cw * ch];
+    let (sw, sh) = ((src.w - 1) as f64, (src.h - 1) as f64);
+    out.d.par_chunks_mut(cw).zip(mask.par_chunks_mut(cw)).enumerate().for_each(|(v, (row, mrow))| {
+        let vv = v as f64 + origin.1;
+        for u in 0..cw {
+            let uu = u as f64 + origin.0;
+            let x = m[0][0] * uu + m[0][1] * vv;
+            let y = m[1][0] * uu + m[1][1] * vv;
+            if x >= 0.0 && x <= sw && y >= 0.0 && y <= sh {
+                row[u] = bilinear(src, x, y);
+                mrow[u] = 1;
+            }
+        }
+    });
+    (out, mask)
+}
+
+/// Canvas bounds for warping a w x h source with forward map `fwd` (source -> canvas).
+pub fn warped_bounds(w: usize, h: usize, fwd: &Mat2) -> ((f64, f64), usize, usize) {
+    let cs = [(0.0, 0.0), (w as f64, 0.0), (0.0, h as f64), (w as f64, h as f64)];
+    let (mut x0, mut y0, mut x1, mut y1) = (f64::MAX, f64::MAX, f64::MIN, f64::MIN);
+    for (x, y) in cs {
+        let u = fwd[0][0] * x + fwd[0][1] * y;
+        let v = fwd[1][0] * x + fwd[1][1] * y;
+        x0 = x0.min(u);
+        y0 = y0.min(v);
+        x1 = x1.max(u);
+        y1 = y1.max(v);
+    }
+    ((x0.floor(), y0.floor()), (x1.ceil() - x0.floor()) as usize, (y1.ceil() - y0.floor()) as usize)
+}
+
+/// Binary erosion with a k x k square (outside the image counts as valid, like OpenCV).
+pub fn erode(mask: &[u8], w: usize, h: usize, k: usize) -> Vec<u8> {
+    // integral image of invalid pixels
+    let mut ii = vec![0u32; (w + 1) * (h + 1)];
+    for y in 0..h {
+        let mut run = 0u32;
+        for x in 0..w {
+            run += (mask[y * w + x] == 0) as u32;
+            ii[(y + 1) * (w + 1) + x + 1] = ii[y * (w + 1) + x + 1] + run;
+        }
+    }
+    let r = (k / 2) as isize;
+    let mut out = vec![0u8; w * h];
+    for y in 0..h as isize {
+        for x in 0..w as isize {
+            let (ya, yb) = ((y - r).max(0) as usize, ((y + r + 1).min(h as isize)) as usize);
+            let (xa, xb) = ((x - r).max(0) as usize, ((x + r + 1).min(w as isize)) as usize);
+            let s = ii[yb * (w + 1) + xb] + ii[ya * (w + 1) + xa] - ii[ya * (w + 1) + xb] - ii[yb * (w + 1) + xa];
+            out[y as usize * w + x as usize] = (s == 0) as u8;
+        }
+    }
+    out
+}
+
+pub fn maximum_filter(a: &[f64], h: usize, w: usize, k: usize) -> Vec<f64> {
+    let r = (k / 2) as isize;
+    let mut tmp = vec![0f64; h * w];
+    for y in 0..h {
+        for x in 0..w as isize {
+            let mut m = f64::MIN;
+            for d in -r..=r {
+                let xx = (x + d).clamp(0, w as isize - 1) as usize;
+                m = m.max(a[y * w + xx]);
+            }
+            tmp[y * w + x as usize] = m;
+        }
+    }
+    let mut out = vec![0f64; h * w];
+    for y in 0..h as isize {
+        for x in 0..w {
+            let mut m = f64::MIN;
+            for d in -r..=r {
+                let yy = (y + d).clamp(0, h as isize - 1) as usize;
+                m = m.max(tmp[yy * w + x]);
+            }
+            out[y as usize * w + x] = m;
+        }
+    }
+    out
+}
