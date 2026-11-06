@@ -585,7 +585,13 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             match (wp & 0xffff) as u16 {
                 ID_KEY_NEW => {
                     let s = st();
-                    let path = s.cfg.key_path.clone();
+                    // After the key was unloaded the path is empty: fall back to the default one.
+                    let path = if s.cfg.key_path.as_os_str().is_empty() {
+                        super::config::app_dir().join("blindmark.key")
+                    } else {
+                        s.cfg.key_path.clone()
+                    };
+                    s.cfg.key_path = path.clone();
                     if path.exists() {
                         error(
                             h,

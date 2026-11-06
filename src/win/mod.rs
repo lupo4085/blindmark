@@ -445,7 +445,9 @@ impl App {
     pub fn load_key_and_registry(&mut self, first_run: bool) {
         self.key = None;
         let kp = self.cfg.key_path.clone();
-        if kp.exists() {
+        if kp.as_os_str().is_empty() {
+            // Key unloaded on purpose: nothing to read.
+        } else if kp.exists() {
             match std::fs::read_to_string(&kp).map_err(anyhow::Error::from).and_then(|t| keys::parse_key_file(&t)) {
                 Ok(k) => self.key = Some(k),
                 Err(e) => error(self.hwnd, &format!("无法读取密钥文件：\n{}\n\n{e}", kp.display())),
@@ -472,6 +474,13 @@ impl App {
         self.reg = None;
         self.reg_error = None;
         self.thumbs = Arc::new(ThumbIndex::new());
+        if self.cfg.registry_dir.as_os_str().is_empty() {
+            // Registry unloaded on purpose: keep it detached until the user picks a folder.
+            embed::refresh_channels(self);
+            regpage::refresh(self);
+            self.update_status_parts();
+            return;
+        }
         match Registry::open(&self.cfg.registry_dir) {
             Ok(mut r) => {
                 if let Some(k) = &self.key {
@@ -554,6 +563,46 @@ impl App {
                 Err(e) => error(self.hwnd, &format!("这不是有效的密钥文件：{e}")),
             }
         }
+    }
+
+    /// Detach the key from the app. The key file itself is left untouched.
+    pub fn unload_key(&mut self) {
+        if self.cfg.key_path.as_os_str().is_empty() && self.key.is_none() {
+            info(self.hwnd, "当前没有已载入的密钥。");
+            return;
+        }
+        if !ask(
+            self.hwnd,
+            "要从本程序卸载当前密钥吗？\n\n密钥文件不会被删除，仍保留在原位置。卸载后登记表也将不可用，直至重新载入同一密钥。",
+        ) {
+            return;
+        }
+        self.key = None;
+        self.cfg.key_path = PathBuf::new();
+        self.cfg.save();
+        self.reload_registry();
+        self.set_status("密钥已卸载（文件保留在原处）");
+        setpage::load(self);
+    }
+
+    /// Detach the registry folder from the app. Nothing on disk is removed.
+    pub fn unload_registry(&mut self) {
+        if self.cfg.registry_dir.as_os_str().is_empty() {
+            info(self.hwnd, "当前没有已载入的登记表。");
+            return;
+        }
+        if !ask(
+            self.hwnd,
+            "要从本程序卸载当前登记表吗？\n\n登记表文件夹不会被删除，仍保留在原位置。卸载后需重新指定文件夹才能继续登记。",
+        ) {
+            return;
+        }
+        self.reg = None;
+        self.cfg.registry_dir = PathBuf::new();
+        self.cfg.save();
+        self.reload_registry();
+        self.set_status("登记表已卸载（文件夹保留在原处）");
+        setpage::load(self);
     }
 
     pub fn backup_registry(&mut self) {

@@ -33,6 +33,8 @@ const REMEMBER: u16 = 1422;
 const AUTOCLIP: u16 = 1423;
 const DEFAULTS: u16 = 1424;
 const APPLY: u16 = 1425;
+const UNLOAD_KEY: u16 = 1426;
+const UNLOAD_REG: u16 = 1427;
 
 const THREAD_CHOICES: [usize; 7] = [0, 1, 2, 4, 8, 12, 16];
 
@@ -42,10 +44,12 @@ pub struct SetPage {
     key_path: HWND,
     key_fp: HWND,
     key_btns: [HWND; 3],
+    unload_key: HWND,
     // registry
     reg_path: HWND,
     reg_info: HWND,
     reg_btns: [HWND; 4],
+    unload_reg: HWND,
     // defaults
     l_strength: HWND,
     strength: HWND,
@@ -87,6 +91,7 @@ impl SetPage {
         let key_path = label(p, "");
         let key_fp = label(p, "");
         let key_btns = [button(p, NEW_KEY, "新建密钥…"), button(p, PICK_KEY, "选择密钥…"), button(p, BACKUP_KEY, "备份密钥…")];
+        let unload_key = button(p, UNLOAD_KEY, "卸载密钥");
         let reg_path = label(p, "");
         let reg_info = label(p, "");
         let reg_btns = [
@@ -95,6 +100,7 @@ impl SetPage {
             button(p, REG_BACKUP, "备份…"),
             button(p, REG_CSV, "导出 CSV…"),
         ];
+        let unload_reg = button(p, UNLOAD_REG, "卸载登记表");
         let l_strength = label(p, "强度");
         let strength = trackbar(p, STRENGTH, 15, 40);
         let strength_val = label(p, "");
@@ -140,9 +146,11 @@ impl SetPage {
             key_path,
             key_fp,
             key_btns,
+            unload_key,
             reg_path,
             reg_info,
             reg_btns,
+            unload_reg,
             l_strength,
             strength,
             strength_val,
@@ -207,6 +215,7 @@ pub fn layout(a: &App, w: i32, _h: i32) {
         mv(b, bx, y + sc(72), sc(100), bh);
         bx += sc(106);
     }
+    mv(s.unload_key, bx, y + sc(72), sc(92), bh);
     y += gh + gap;
     // --- registry (left)
     mv(s.groups[1], lx, y, col_w, gh);
@@ -217,6 +226,7 @@ pub fn layout(a: &App, w: i32, _h: i32) {
         mv(*b, bx, y + sc(72), sc(bw), bh);
         bx += sc(bw) + sc(6);
     }
+    mv(s.unload_reg, bx, y + sc(72), sc(96), bh);
     y += gh + gap;
     // --- defaults (left)
     let dh = sc(196);
@@ -395,8 +405,12 @@ pub fn command(a: &mut App, id: u16, code: u32, _ctl: HWND) {
             }
         }
         REG_OPEN => {
-            let _ = std::fs::create_dir_all(&a.cfg.registry_dir);
-            shell_open(&a.cfg.registry_dir.display().to_string());
+            if a.cfg.registry_dir.as_os_str().is_empty() {
+                info(a.hwnd, "登记表尚未指定文件夹，请先点击“更改文件夹…”。");
+            } else {
+                let _ = std::fs::create_dir_all(&a.cfg.registry_dir);
+                shell_open(&a.cfg.registry_dir.display().to_string());
+            }
         }
         REG_BACKUP => a.backup_registry(),
         REG_CSV => a.export_csv(),
@@ -412,6 +426,8 @@ pub fn command(a: &mut App, id: u16, code: u32, _ctl: HWND) {
             controls_from(a, &d);
             a.set_status("已恢复默认值——点“应用”保存");
         }
+        UNLOAD_KEY => a.unload_key(),
+        UNLOAD_REG => a.unload_registry(),
         APPLY => apply(a),
         _ => {}
     }
