@@ -166,7 +166,7 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
     hdr.hwndParent = owner;
     hdr.hInstance = hinst();
     hdr.Anonymous1 = PROPSHEETHEADERW_V2_0 { pszIcon: null() };
-    hdr.pszCaption = leak("blindmark 向导");
+    hdr.pszCaption = leak("BlindMark 向导");
     hdr.nPages = pages.len() as u32;
     hdr.Anonymous2 = PROPSHEETHEADERW_V2_1 { nStartPage: 0 };
     hdr.Anonymous3 = PROPSHEETHEADERW_V2_2 { ppsp: pages.as_mut_ptr() };
@@ -376,12 +376,8 @@ fn build_welcome(h: HWND) {
     label_id(
         h,
         ID_WELCOME_BODY,
-        "blindmark 是一款用于图片溯源的水印工具。它依据密钥为图片嵌入不可见的编号，\
-         并在需要时从图片中读回该编号，用以确认图片的归属与来源。\n\n\
-         编号与密钥严格对应：只有持有同一密钥的人方能读取水印。密钥一旦遗失，\
-         已嵌入的编号将无法再被识别，故请务必妥善备份密钥文件与登记表。\n\n\
-         本向导依次完成以下步骤：选择任务、确认密钥、选取图片、设定参数、执行处理。\
-         每一步均可通过“上一步”返回修改；中途取消不会对图片作任何改动。",
+        "本向导将指导您创建密钥、添加水印和检测水印。\n\n\
+         请单击“下一步”继续，或单击“取消”退出向导。",
     );
 }
 
@@ -406,7 +402,8 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             1
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "欢迎使用 blindmark", "本向导将协助您完成一次完整的处理流程。");
+            let title = format!("欢迎使用 BlindMark {}", env!("CARGO_PKG_VERSION"));
+            paint_banner(h, wp as HDC, &title, "本程序是一款图片溯源的水印工具。");
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
