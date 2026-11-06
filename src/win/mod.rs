@@ -6,6 +6,7 @@ mod about;
 mod config;
 mod controls;
 mod detect;
+mod distdialog;
 mod embed;
 mod regpage;
 mod setpage;
@@ -36,6 +37,7 @@ pub const WM_WORKER: u32 = WM_APP + 1;
 const MAIN_CLASS: windows_sys::core::PCWSTR = windows_sys::core::w!("BlindmarkMain");
 const PAGE_CLASS: windows_sys::core::PCWSTR = windows_sys::core::w!("BlindmarkPage");
 pub const DLG_CLASS: windows_sys::core::PCWSTR = windows_sys::core::w!("BlindmarkDialog");
+pub const DIST_CLASS: windows_sys::core::PCWSTR = windows_sys::core::w!("BlindmarkDist");
 
 /// Menu / accelerator command IDs (100..199). Pages use 1100.., 1200.., 1300.., 1400..; dialogs 1500..
 pub mod cmd {
@@ -297,6 +299,7 @@ fn register_classes() {
         RegisterClassExW(&mk(MAIN_CLASS, main_proc, (COLOR_BTNFACE + 1) as usize as HBRUSH));
         RegisterClassExW(&mk(PAGE_CLASS, page_proc, (COLOR_WINDOW + 1) as usize as HBRUSH));
         RegisterClassExW(&mk(DLG_CLASS, about::dialog_proc, (COLOR_BTNFACE + 1) as usize as HBRUSH));
+        RegisterClassExW(&mk(DIST_CLASS, distdialog::proc_, (COLOR_BTNFACE + 1) as usize as HBRUSH));
     }
 }
 

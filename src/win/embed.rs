@@ -28,6 +28,7 @@ const OPEN_AFTER: u16 = 1112;
 const START: u16 = 1113;
 const CANCEL: u16 = 1114;
 const SAME_DIR: u16 = 1115;
+const DIST: u16 = 1116;
 
 pub const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff", "gif"];
 
@@ -64,6 +65,7 @@ pub struct EmbedPage {
     open_after: HWND,
     progress: HWND,
     start: HWND,
+    dist: HWND,
     cancel_btn: HWND,
     items: Vec<Item>,
     pub cancel: Option<Arc<AtomicBool>>,
@@ -82,6 +84,7 @@ impl EmbedPage {
             button(p, REMOVE, "移除所选"),
             button(p, CLEAR, "清空"),
         ];
+        let dist_btn = button(p, DIST, "分发给多人…");
         let hint = label(p, "提示：可以把图片或文件夹直接拖进窗口");
         let list = listview(p, LIST, false);
         for (i, (t, wd, r)) in [("文件名", 220, false), ("尺寸", 100, false), ("大小", 80, true), ("位置", 260, false), ("状态", 240, false)]
@@ -127,6 +130,7 @@ impl EmbedPage {
             progress,
             start,
             cancel_btn,
+            dist: dist_btn,
             items: vec![],
             cancel: None,
             run_ok: 0,
@@ -145,6 +149,13 @@ impl EmbedPage {
     }
 }
 
+impl EmbedPage {
+    /// Images currently queued on the page, in list order.
+    pub fn files(&self) -> Vec<PathBuf> {
+        self.items.iter().map(|i| i.path.clone()).collect()
+    }
+}
+
 pub fn is_hint(a: &App, h: HWND) -> bool {
     h == a.embed.hint
 }
@@ -158,6 +169,8 @@ pub fn layout(a: &App, w: i32, h: i32) {
         mv(*b, x, m, sc(bw), bh);
         x += sc(bw) + sc(6);
     }
+    mv(e.dist, x + sc(6), m, sc(110), bh);
+    x += sc(110) + sc(12);
     mv(e.hint, x + sc(8), m + sc(6), w - x - m - sc(8), sc(20));
     let bottom_row = sc(40);
     let grp_h = sc(122);
@@ -225,6 +238,7 @@ pub fn command(a: &mut App, id: u16, code: u32, _ctl: HWND) {
     }
     match id {
         ADD => add_files_dialog(a),
+        DIST => super::distdialog::open(a.hwnd, a.embed.files()),
         FOLDER => add_folder_dialog(a),
         REMOVE => remove_selected(a),
         CLEAR => clear(a),
