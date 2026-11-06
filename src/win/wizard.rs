@@ -39,7 +39,6 @@ const PAGE_RUN: i32 = 206;
 
 const BM_WATERMARK: usize = 301;
 
-const ID_WELCOME_TITLE: u16 = 1670;
 const ID_WELCOME_BODY: u16 = 1671;
 
 const ID_EMBED: u16 = 1601;
@@ -77,8 +76,6 @@ const ID_RESULT: u16 = 1662;
 const TIMER_RUN: usize = 1;
 
 /// Width of the painted watermark strip, at 96 DPI.
-/// Height of the painted header band, at 96 DPI.
-const HEADER_H: i32 = 56;
 
 // ------------------------------------------------------------------ state
 
@@ -242,15 +239,12 @@ fn content_x(_w: i32) -> i32 {
     CONTENT_X
 }
 
-const CONTENT_W: i32 = 300;
-/// Height of the visible page area, used to anchor the bottom row of each page.
-const PAGE_H: i32 = 330;
-
-fn content_w(_w: i32) -> i32 {
-    CONTENT_W
+/// Content width: fills the page, which on a consistent-DPI setup is the visible area.
+fn content_w(h: HWND) -> i32 {
+    let (pw, _) = client_size(h);
+    (pw - CONTENT_X - 24).max(180)
 }
 
-// ------------------------------------------------------------------ painting
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
@@ -321,6 +315,12 @@ fn set_buttons(h: HWND, flags: u32) {
 }
 
 /// Hold the current page: DWL_MSGRESULT = -1 and TRUE, as the SDK documents.
+/// comctl32 sizes the page before the wizard frame settles, so one layout pass runs too
+/// early. Schedule a single deferred pass once the page is actually shown.
+fn schedule_relayout(h: HWND) {
+    unsafe { SetTimer(h, 0x7A, 120, None) };
+}
+
 fn block(h: HWND) -> isize {
     unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT as i32, -1) };
     1
@@ -368,7 +368,6 @@ fn create_readonly(parent: HWND, id: u16) -> HWND {
 // ------------------------------------------------------------------ page 200: welcome
 
 fn build_welcome(h: HWND) {
-    label_id(h, ID_WELCOME_TITLE, "欢迎使用 blindmark");
     label_id(
         h,
         ID_WELCOME_BODY,
@@ -380,11 +379,10 @@ fn build_welcome(h: HWND) {
 }
 
 fn layout_welcome(h: HWND) {
-    let (w, _ht) = client_size(h);
+    let (w, ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
-    mv(ctl(h, ID_WELCOME_TITLE), x, 76, cw, 34);
-    mv(ctl(h, ID_WELCOME_BODY), x, 118, cw, PAGE_H - 132);
+    let cw = content_w(h);
+    mv(ctl(h, ID_WELCOME_BODY), x, 84, cw, (ht - 100).max(80));
 }
 
 unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -392,8 +390,8 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
         WM_INITDIALOG => {
             build_welcome(h);
             set_font_tree(h, super::fonts().normal);
-            set_font(ctl(h, ID_WELCOME_TITLE), super::fonts().big);
             layout_welcome(h);
+            schedule_relayout(h);
             1
         }
         WM_SIZE => {
@@ -401,7 +399,7 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             1
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "", "");
+            paint_banner(h, wp as HDC, "欢迎使用 blindmark", "分几步完成，随时可以返回修改。");
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
@@ -412,6 +410,11 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
                 return 1;
             }
             0
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_welcome(h);
+            return 1;
         }
         _ => 0,
     }
@@ -428,10 +431,10 @@ fn build_mode(h: HWND) {
 fn layout_mode(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
+    let cw = content_w(h);
     mv(ctl(h, ID_EMBED), x, 84, cw, 26);
     mv(ctl(h, ID_DETECT), x, 118, cw, 26);
-    mv(ctl(h, ID_MODE_HINT), x, PAGE_H - 34, cw, 20);
+    mv(ctl(h, ID_MODE_HINT), x, _ht - 34, cw, 20);
 }
 
 unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
@@ -440,6 +443,7 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
             build_mode(h);
             set_font_tree(h, super::fonts().normal);
             layout_mode(h);
+            schedule_relayout(h);
             1
         }
         WM_SIZE => {
@@ -474,6 +478,11 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if _wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_mode(h);
+            return 1;
+        }
         _ => 0,
     }
 }
@@ -484,7 +493,9 @@ fn build_key(h: HWND) {
     let lv = listview(h, ID_KEY_TABLE, true);
     lv_column(lv, 0, "项目", 88, false);
     let (w, _) = client_size(h);
-    lv_column(lv, 1, "内容", CONTENT_W - 88 - 20, false);
+    let (w, _) = client_size(h);
+    let (pw, _) = client_size(h);
+    lv_column(lv, 1, "内容", (pw - CONTENT_X - 24 - 88 - 20).max(120), false);
     create(windows_sys::core::w!("BUTTON"), "创建新密钥…", (WS_TABSTOP | BS_DEFPUSHBUTTON as u32) as u32, 0, h, ID_KEY_NEW);
     button(h, ID_KEY_PICK, "使用已有的密钥文件…");
     button(h, ID_KEY_OPEN, "打开所在文件夹");
@@ -495,8 +506,8 @@ fn build_key(h: HWND) {
 fn layout_key(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
-    let warn_y = PAGE_H - 46;
+    let cw = content_w(h);
+    let warn_y = _ht - 46;
     let row2 = warn_y - 38;
     let row1 = row2 - 36;
     mv(ctl(h, ID_KEY_TABLE), x, 78, cw, (row1 - 12 - 78).max(80));
@@ -640,6 +651,11 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             }
             0
         }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_key(h);
+            return 1;
+        }
         _ => 0,
     }
 }
@@ -657,8 +673,8 @@ fn build_files(h: HWND) {
 fn layout_files(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
-    let by = PAGE_H - 46;
+    let cw = content_w(h);
+    let by = _ht - 46;
     mv(ctl(h, ID_LIST), x, 78, cw, (by - 10 - 78).max(80));
     let bw = sc(104);
     mv(ctl(h, ID_ADD_FILES), x, by, bw, sc(28));
@@ -746,6 +762,11 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_files(h);
+            return 1;
+        }
         _ => 0,
     }
 }
@@ -778,7 +799,7 @@ fn build_embed(h: HWND) {
 fn layout_embed(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
+    let cw = content_w(h);
     let row = sc(30);
     let mut y = 82;
     mv(ctl(h, 1680), x, y + sc(6), sc(40), sc(18));
@@ -858,6 +879,11 @@ unsafe extern "system" fn page_embed(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             }
             0
         }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_embed(h);
+            return 1;
+        }
         _ => 0,
     }
 }
@@ -879,7 +905,7 @@ fn build_detect(h: HWND) {
 fn layout_detect(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
+    let cw = content_w(h);
     let mut y = 86;
     for id in [ID_OPT_AFFINE, ID_OPT_PHOTO, ID_OPT_CONTENT, ID_OPT_STRICT] {
         mv(ctl(h, id), x, y, cw, sc(24));
@@ -926,6 +952,11 @@ unsafe extern "system" fn page_detect(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM
             }
             0
         }
+        WM_TIMER if _wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_detect(h);
+            return 1;
+        }
         _ => 0,
     }
 }
@@ -941,10 +972,10 @@ fn build_run(h: HWND) {
 fn layout_run(h: HWND) {
     let (w, _ht) = client_size(h);
     let x = content_x(w);
-    let cw = content_w(w);
+    let cw = content_w(h);
     mv(ctl(h, ID_PROGRESS), x, 80, cw, 16);
     mv(ctl(h, ID_STATUS), x, 102, cw, 18);
-    mv(ctl(h, ID_RESULT), x, 126, cw, PAGE_H - 140);
+    mv(ctl(h, ID_RESULT), x, 126, cw, (_ht - 138).max(60));
 }
 
 fn start_run(h: HWND) {
@@ -1129,6 +1160,11 @@ unsafe extern "system" fn page_run(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_run(h);
+            return 1;
+        }
         WM_TIMER => {
             if wp == TIMER_RUN {
                 drain_run(h);
