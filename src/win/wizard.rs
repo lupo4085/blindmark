@@ -44,6 +44,8 @@ const ID_WELCOME_BODY: u16 = 1671;
 const ID_EMBED: u16 = 1601;
 const ID_DETECT: u16 = 1602;
 const ID_MODE_HINT: u16 = 1603;
+const ID_EMBED_HINT: u16 = 1604;
+const ID_DETECT_HINT: u16 = 1605;
 
 const ID_KEY_TABLE: u16 = 1610;
 const ID_KEY_NEW: u16 = 1611;
@@ -278,12 +280,15 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
         SetBkMode(hdc, TRANSPARENT as i32);
         SelectObject(hdc, f.big as _);
         SetTextColor(hdc, rgb(28, 32, 36));
+        let text_w = (cw - x - 12).max(120);
         let t = w(title);
-        TextOutW(hdc, x, 12, t.as_ptr(), (t.len() - 1) as i32);
+        let mut r = RECT { left: x, top: 8, right: x + text_w, bottom: 40 };
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(hdc, f.normal as _);
         SetTextColor(hdc, rgb(96, 104, 112));
         let t = w(subtitle);
-        TextOutW(hdc, x, 42, t.as_ptr(), (t.len() - 1) as i32);
+        let mut r = RECT { left: x, top: 38, right: x + text_w, bottom: 66 };
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
         let line = RECT { left: x, top: 68, right: cw - 12, bottom: 69 };
         fill(hdc, &line, rgb(226, 230, 234));
     }
@@ -371,10 +376,12 @@ fn build_welcome(h: HWND) {
     label_id(
         h,
         ID_WELCOME_BODY,
-        "这个向导分几步带你完成一件事：给图片嵌入可追溯的编号，\
-         或者检查一张图里有没有你自己的编号。\n\n\
-         每一步都可以用“上一步”返回修改。中途取消不会改动任何图片。\n\n\
-         接下来先确认你手上有没有密钥——没有也没关系，向导会帮你新建一把。",
+        "blindmark 是一款用于图片溯源的水印工具。它依据密钥为图片嵌入不可见的编号，\
+         并在需要时从图片中读回该编号，用以确认图片的归属与来源。\n\n\
+         编号与密钥严格对应：只有持有同一密钥的人方能读取水印。密钥一旦遗失，\
+         已嵌入的编号将无法再被识别，故请务必妥善备份密钥文件与登记表。\n\n\
+         本向导依次完成以下步骤：选择任务、确认密钥、选取图片、设定参数、执行处理。\
+         每一步均可通过“上一步”返回修改；中途取消不会对图片作任何改动。",
     );
 }
 
@@ -399,7 +406,7 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
             1
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "欢迎使用 blindmark", "分几步完成，随时可以返回修改。");
+            paint_banner(h, wp as HDC, "欢迎使用 blindmark", "本向导将协助您完成一次完整的处理流程。");
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
@@ -423,9 +430,11 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM
 // ------------------------------------------------------------------ page 201: task
 
 fn build_mode(h: HWND) {
-    radio(h, ID_EMBED, "给图片加水印", true);
-    radio(h, ID_DETECT, "检测图片水印", false);
-    label_id(h, ID_MODE_HINT, "选好后按“下一步”。之后可以随时用“上一步”回来改。");
+    radio(h, ID_EMBED, "为图片嵌入水印", true);
+    radio(h, ID_DETECT, "检测图片中的水印", false);
+    label_id(h, ID_EMBED_HINT, "为原始图片生成带编号的副本，并将该编号登记到登记表。");
+    label_id(h, ID_DETECT_HINT, "读取图片中已嵌入的编号，并核对它是否出自本人。");
+    label_id(h, ID_MODE_HINT, "选定后点击“下一步”继续。");
 }
 
 fn layout_mode(h: HWND) {
@@ -433,7 +442,9 @@ fn layout_mode(h: HWND) {
     let x = content_x(w);
     let cw = content_w(h);
     mv(ctl(h, ID_EMBED), x, 84, cw, 26);
-    mv(ctl(h, ID_DETECT), x, 118, cw, 26);
+    mv(ctl(h, ID_EMBED_HINT), x + 24, 112, cw - 24, 20);
+    mv(ctl(h, ID_DETECT), x, 142, cw, 26);
+    mv(ctl(h, ID_DETECT_HINT), x + 24, 170, cw - 24, 20);
     mv(ctl(h, ID_MODE_HINT), x, _ht - 34, cw, 20);
 }
 
@@ -451,7 +462,7 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
             1
         }
         WM_ERASEBKGND => {
-            paint_banner(h, _wp as HDC, "选择任务", "你想给图片加水印，还是检查图片里有没有你的水印？");
+            paint_banner(h, _wp as HDC, "选择任务", "请选择本次需要执行的操作。");
             1
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, _wp as HDC, lp as HWND, 0),
@@ -468,7 +479,7 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
                 }
                 PSN_WIZNEXT => {
                     if !checked(ctl(h, ID_EMBED)) && !checked(ctl(h, ID_DETECT)) {
-                        warn(h, "请先选择要加水印还是检测水印。");
+                        warn(h, "尚未选择任务，请先选择需执行的操作。");
                         return block(h);
                     }
                     st().mode = Some(if checked(ctl(h, ID_EMBED)) { Mode::Embed } else { Mode::Detect });
@@ -496,9 +507,9 @@ fn build_key(h: HWND) {
     let (w, _) = client_size(h);
     let (pw, _) = client_size(h);
     lv_column(lv, 1, "内容", (pw - CONTENT_X - 24 - 88 - 20).max(120), false);
-    create(windows_sys::core::w!("BUTTON"), "创建新密钥…", (WS_TABSTOP | BS_DEFPUSHBUTTON as u32) as u32, 0, h, ID_KEY_NEW);
-    button(h, ID_KEY_PICK, "使用已有的密钥文件…");
-    button(h, ID_KEY_OPEN, "打开所在文件夹");
+    create(windows_sys::core::w!("BUTTON"), "新建密钥…", (WS_TABSTOP | BS_DEFPUSHBUTTON as u32) as u32, 0, h, ID_KEY_NEW);
+    button(h, ID_KEY_PICK, "选择已有密钥…");
+    button(h, ID_KEY_OPEN, "打开文件夹");
     let warn = label_id(h, ID_KEY_WARN, "密钥决定谁能读出水印。请把它备份到安全的地方。");
     set_font(warn, super::fonts().bold);
 }
@@ -530,7 +541,7 @@ fn refresh_key(h: HWND) {
         Err(e) => (0, format!("（{e:#}）")),
     };
     let rows: [(&str, String); 5] = [
-        ("状态", if loaded { "已加载".into() } else { "未加载，需要新建或选择".into() }),
+        ("状态", if loaded { "已载入".into() } else { "未载入".into() }),
         ("密钥文件", if exists { path } else { format!("{path}（不存在）") }),
         ("指纹", fp),
         ("登记表", format!("{}{reg_note}", s.cfg.registry_dir.display())),
@@ -569,7 +580,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             return 1;
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "密钥", "这一把密钥决定谁能读出你的水印。");
+            paint_banner(h, wp as HDC, "密钥", "密钥用于生成并读取水印，请确认其来源与备份。");
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, ID_KEY_WARN),
@@ -581,7 +592,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     if path.exists() {
                         error(
                             h,
-                            &format!("{} 已经存在。向导不会覆盖已有密钥，请先把它挪走，或在“设置”里换一个位置。", path.display()),
+                            &format!("该位置已存在密钥文件：{}\n\n为避免覆盖，请先将其移走，或在“设置”中指定其他位置。", path.display()),
                         );
                         return 1;
                     }
@@ -597,7 +608,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                         Ok(()) => {
                             load_key_from_settings();
                             refresh_key(h);
-                            info(h, &format!("已新建密钥：\n{}\n\n请立刻备份这个文件。丢了它，你再也读不出自己的水印。", path.display()));
+                            info(h, &format!("密钥已生成并保存至：\n{}\n\n请立即备份该文件。密钥遗失后，已嵌入的编号将无法读取。", path.display()));
                         }
                         Err(e) => error(h, &format!("新建密钥失败：{e}")),
                     }
@@ -612,7 +623,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                                 s.cfg.key_path = p;
                                 refresh_key(h);
                             }
-                            Err(e) => error(h, &format!("这不是有效的密钥文件：{e}")),
+                            Err(e) => error(h, &format!("所选文件不是有效的密钥文件：{e}")),
                         }
                     }
                     return 1;
@@ -642,7 +653,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 }
                 PSN_WIZNEXT => {
                     if st().key.is_none() {
-                        error(h, "还没有可用的密钥。请先新建一把，或者选择一个已有的密钥文件。");
+                        error(h, "尚未载入密钥，请先新建或选择密钥文件。");
                         return block(h);
                     }
                     return 0;
@@ -704,7 +715,7 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return 1;
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "选择图片", "可以一次加入多张，处理顺序与列表一致。");
+            paint_banner(h, wp as HDC, "选取图片", "可一次选取多张，处理顺序与列表顺序一致。");
             1
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
@@ -718,7 +729,7 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                     return 1;
                 }
                 ID_ADD_FOLDER => {
-                    if let Some(d) = pick_folder(h, "添加文件夹中的图片") {
+                    if let Some(d) = pick_folder(h, "选择图片所在文件夹") {
                         let found = images_in(&d);
                         st().files.extend(found);
                         refresh_files(h);
@@ -753,7 +764,7 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
                 PSN_WIZNEXT => {
                     if st().files.is_empty() {
-                        warn(h, "先加入至少一张图片。");
+                        warn(h, "列表中尚无图片，请先添加至少一张图片。");
                         return block(h);
                     }
                     return 0;
@@ -832,7 +843,7 @@ unsafe extern "system" fn page_embed(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             return 1;
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "加水印设置", "强度、格式与输出位置。");
+            paint_banner(h, wp as HDC, "水印参数", "设定嵌入强度、输出格式与保存位置。");
             1
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
@@ -892,10 +903,10 @@ unsafe extern "system" fn page_embed(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn build_detect(h: HWND) {
     let s = st();
-    checkbox(h, ID_OPT_AFFINE, "仿射同步：处理旋转、镜像、拉伸与错切");
-    checkbox(h, ID_OPT_PHOTO, "拍屏校正：借助登记表把照片拉正（实验性）");
-    checkbox(h, ID_OPT_CONTENT, "画面比对：核对画面是否与登记的图片一致");
-    checkbox(h, ID_OPT_STRICT, "严格判定：提高同步阈值，少误报");
+    checkbox(h, ID_OPT_AFFINE, "仿射同步：还原旋转、镜像、拉伸与错切");
+    checkbox(h, ID_OPT_PHOTO, "拍屏校正：借助登记表修正透视（实验性）");
+    checkbox(h, ID_OPT_CONTENT, "画面比对：核对画面与登记图片是否一致");
+    checkbox(h, ID_OPT_STRICT, "严格判定：提高同步阈值以减少误报");
     set_check(ctl(h, ID_OPT_AFFINE), s.cfg.affine);
     set_check(ctl(h, ID_OPT_PHOTO), s.cfg.photo);
     set_check(ctl(h, ID_OPT_CONTENT), s.cfg.content);
@@ -926,7 +937,7 @@ unsafe extern "system" fn page_detect(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM
             return 1;
         }
         WM_ERASEBKGND => {
-            paint_banner(h, _wp as HDC, "检测选项", "按需要开启更费时的步骤。");
+            paint_banner(h, _wp as HDC, "检测选项", "按需启用较为耗时的处理步骤。");
             1
         }
         WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, _wp as HDC, lp as HWND, 0),
@@ -965,7 +976,7 @@ unsafe extern "system" fn page_detect(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM
 
 fn build_run(h: HWND) {
     progress(h);
-    label_id(h, ID_STATUS, "准备中…");
+    label_id(h, ID_STATUS, "准备就绪…");
     create_readonly(h, ID_RESULT);
 }
 
@@ -984,12 +995,12 @@ fn start_run(h: HWND) {
         return;
     }
     let Some(key) = s.key.clone() else {
-        error(h, "先加载密钥。");
+        error(h, "尚未载入密钥。");
         return;
     };
     let files = s.files.clone();
     if files.is_empty() {
-        error(h, "先加入图片。");
+        error(h, "列表中尚无图片。");
         return;
     }
     let (tx, rx) = channel();
@@ -1001,7 +1012,7 @@ fn start_run(h: HWND) {
     s.ok = 0;
     s.log.clear();
     set_text(ctl(h, ID_RESULT), "");
-    set_text(ctl(h, ID_STATUS), "开始处理…");
+    set_text(ctl(h, ID_STATUS), "正在处理…");
     pb_set(ctl(h, ID_PROGRESS), 0, files.len());
     send(sheet(h), PSM_SETWIZBUTTONS, 0, PSWIZB_DISABLEDFINISH as LPARAM);
 
@@ -1022,7 +1033,7 @@ fn start_run(h: HWND) {
         match mode {
             Mode::Embed => {
                 let Some(reg) = reg.as_mut() else {
-                    let _ = tx.send(Msg::Fatal("登记表无法打开".into()));
+                    let _ = tx.send(Msg::Fatal("登记表无法打开。".into()));
                     return;
                 };
                 for f in &files {
@@ -1077,7 +1088,7 @@ fn start_run(h: HWND) {
 
 fn describe(name: &str, rep: &blindmark::Report) -> String {
     if !rep.det.found {
-        return format!("{name} — 未检测到水印");
+        return format!("{name} — 未检测出水印");
     }
     match rep.det.image_id {
         Some(id) => format!(
@@ -1085,7 +1096,7 @@ fn describe(name: &str, rep: &blindmark::Report) -> String {
             rep.det.z_sync,
             rep.content_similarity.map(|v| format!("{v:.2}")).unwrap_or_else(|| "—".into())
         ),
-        None => format!("{name} — 检测到水印，但无法确定是哪一张（同步 {:.1}）", rep.det.z_sync),
+        None => format!("{name} — 检测到水印，但无法确定具体编号（同步 {:.1}）", rep.det.z_sync),
     }
 }
 
@@ -1129,7 +1140,7 @@ fn drain_run(h: HWND) {
         let s = st();
         let (done, total) = (s.done, s.total);
         set_text(ctl(h, ID_RESULT), &s.log);
-        set_text(ctl(h, ID_STATUS), &format!("{done} / {total} 完成"));
+        set_text(ctl(h, ID_STATUS), &format!("已完成 {done} / {total} 张"));
         pb_set(ctl(h, ID_PROGRESS), done, total.max(1));
     }
     if finished {
@@ -1138,7 +1149,7 @@ fn drain_run(h: HWND) {
         s.finished = true;
         s.rx = None;
         unsafe { KillTimer(h, TIMER_RUN) };
-        set_text(ctl(h, ID_STATUS), &format!("完成：{} / {} 张成功", s.ok, s.total));
+        set_text(ctl(h, ID_STATUS), &format!("处理完成：{} / {} 张成功。", s.ok, s.total));
         send(sheet(h), PSM_SETWIZBUTTONS, 0, PSWIZB_FINISH as LPARAM);
     }
 }
@@ -1156,7 +1167,7 @@ unsafe extern "system" fn page_run(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             return 1;
         }
         WM_ERASEBKGND => {
-            paint_banner(h, wp as HDC, "执行", "完成后用“完成”关闭向导。");
+            paint_banner(h, wp as HDC, "执行", "处理完成后，请点击“完成”关闭本向导。");
             1
         }
         WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
@@ -1192,7 +1203,7 @@ unsafe extern "system" fn page_run(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                 }
                 PSN_QUERYCANCEL => {
                     if st().running {
-                        if ask(h, "任务还在进行。要中止并关闭向导吗？") {
+                        if ask(h, "处理仍在进行，确定中止并关闭本向导吗？") {
                             st().cancel.store(true, Ordering::SeqCst);
                             return 0;
                         }

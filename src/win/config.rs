@@ -72,6 +72,11 @@ impl Settings {
         app_dir().join("settings.json")
     }
 
+    /// True when the wizard has never completed on this profile.
+    pub fn is_first_run() -> bool {
+        !Self::path().exists()
+    }
+
     pub fn load() -> Settings {
         std::fs::read_to_string(Self::path())
             .ok()

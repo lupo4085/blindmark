@@ -242,11 +242,14 @@ pub fn run() {
         ShowWindow(hwnd, show);
     }
 
-    a.load_key_and_registry(true);
+    a.load_key_and_registry(false);
     let start = if a.cfg.start_tab < 0 { a.cfg.last_tab } else { a.cfg.start_tab };
     a.select_tab(start.clamp(0, 3) as usize);
     a.layout();
     unsafe { UpdateWindow(hwnd) };
+    if config::Settings::is_first_run() {
+        a.open_wizard();
+    }
 
     let accel = build_accelerators();
     unsafe {
