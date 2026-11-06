@@ -1,12 +1,13 @@
-//! Guided Wizard97 property sheet: welcome, choose the task, then the steps that belong
-//! to that task, then run.
+//! Guided wizard: welcome, choose the task, then the steps that belong to that task.
 //!
-//! Layout follows the MSDN "Creating Wizards" notes: the welcome page is an exterior
-//! page (PSP_HIDEHEADER, 317x193 dialog units, left 164 px kept clear for the watermark),
-//! every other page is an interior page (317x143) whose header is drawn by the sheet.
-//! Controls are created at run time so they follow the same DPI and font handling as the
-//! tabbed main window; the templates in assets/blindmark.rc.in stay empty.
+//! The banner is painted by the pages themselves. comctl32's Wizard97 banner only works
+//! when it likes the bitmaps, and on this build it either tiles the watermark across the
+//! whole page or drops the header text, so the sheet runs as PSH_WIZARD_LITE and every
+//! page paints the left strip and its own header in WM_ERASEBKGND. This is the
+//! "backward-compatible wizard" layout from the MSDN "Creating Wizards" page, applied
+//! unconditionally.
 #![allow(clippy::too_many_lines)]
+#![allow(unsafe_op_in_unsafe_fn)]
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -16,12 +17,13 @@ use std::sync::mpsc::{channel, Receiver};
 use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::*;
-use windows_sys::Win32::Graphics::Gdi::{DeleteObject, HBITMAP, LoadBitmapW};
+use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::HiDpi::*;
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use blindmark::registry::{load_image, Registry, ThumbIndex};
 use blindmark::keys;
+use blindmark::registry::{load_image, Registry, ThumbIndex};
 
 use super::config::Settings;
 use super::util::*;
@@ -37,7 +39,6 @@ const PAGE_DETECT: i32 = 205;
 const PAGE_RUN: i32 = 206;
 
 const BM_WATERMARK: usize = 301;
-const BM_HEADER: usize = 302;
 
 const ID_WELCOME_TITLE: u16 = 1670;
 const ID_WELCOME_BODY: u16 = 1671;
@@ -46,9 +47,11 @@ const ID_EMBED: u16 = 1601;
 const ID_DETECT: u16 = 1602;
 const ID_MODE_HINT: u16 = 1603;
 
-const ID_KEY_INFO: u16 = 1610;
+const ID_KEY_TABLE: u16 = 1610;
 const ID_KEY_NEW: u16 = 1611;
 const ID_KEY_PICK: u16 = 1612;
+const ID_KEY_OPEN: u16 = 1613;
+const ID_KEY_WARN: u16 = 1614;
 
 const ID_LIST: u16 = 1620;
 const ID_ADD_FILES: u16 = 1621;
@@ -73,6 +76,10 @@ const ID_STATUS: u16 = 1661;
 const ID_RESULT: u16 = 1662;
 
 const TIMER_RUN: usize = 1;
+
+/// Width of the painted watermark strip, at 96 DPI.
+/// Height of the painted header band, at 96 DPI.
+const HEADER_H: i32 = 56;
 
 // ------------------------------------------------------------------ state
 
@@ -103,6 +110,8 @@ struct State {
     log: String,
     cancel: Arc<AtomicBool>,
     rx: Option<Receiver<Msg>>,
+    /// Watermark bitmap, painted by every page in WM_ERASEBKGND.
+    bmp: HBITMAP,
 }
 
 thread_local! {
@@ -130,28 +139,27 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
         log: String::new(),
         cancel: Arc::new(AtomicBool::new(false)),
         rx: None,
+        bmp: null_mut(),
     });
     let raw: *mut State = &mut *boxed;
     STATE.with(|c| c.set(raw));
 
     let mut pages = vec![
-        page(PAGE_WELCOME, "", "", true, page_welcome),
-        page(PAGE_MODE, "选择任务", "你想给图片加水印，还是检查图片里有没有你的水印？", false, page_mode),
-        page(PAGE_KEY, "密钥", "该密钥决定谁能读出你的水印。", false, page_key),
-        page(PAGE_FILES, "选择图片", "可以一次加入多张。", false, page_files),
-        page(PAGE_EMBED, "加水印设置", "强度、格式与输出位置。", false, page_embed),
-        page(PAGE_DETECT, "检测选项", "按需要开启更费时的步骤。", false, page_detect),
-        page(PAGE_RUN, "执行", "完成后关闭向导。", false, page_run),
+        page(PAGE_WELCOME, page_welcome),
+        page(PAGE_MODE, page_mode),
+        page(PAGE_KEY, page_key),
+        page(PAGE_FILES, page_files),
+        page(PAGE_EMBED, page_embed),
+        page(PAGE_DETECT, page_detect),
+        page(PAGE_RUN, page_run),
     ];
 
-    let bm_watermark = load_bitmap(BM_WATERMARK);
-    let bm_header = load_bitmap(BM_HEADER);
+    let bmp = load_bitmap(BM_WATERMARK);
+    st().bmp = bmp;
 
-    // No PSH_HEADER / PSH_WATERMARK: the sheet turns the banner bitmap into a tiled brush
-    // and drops the header text, so the strip stays blank for the pages to paint.
     let mut hdr: PROPSHEETHEADERW_V2 = unsafe { std::mem::zeroed() };
     hdr.dwSize = std::mem::size_of::<PROPSHEETHEADERW_V2>() as u32;
-    hdr.dwFlags = PSH_WIZARD97 | PSH_PROPSHEETPAGE;
+    hdr.dwFlags = PSH_WIZARD_LITE | PSH_PROPSHEETPAGE;
     hdr.hwndParent = owner;
     hdr.hInstance = hinst();
     hdr.Anonymous1 = PROPSHEETHEADERW_V2_0 { pszIcon: null() };
@@ -160,20 +168,26 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
     hdr.Anonymous2 = PROPSHEETHEADERW_V2_1 { nStartPage: 0 };
     hdr.Anonymous3 = PROPSHEETHEADERW_V2_2 { ppsp: pages.as_mut_ptr() };
     hdr.pfnCallback = None;
-    hdr.Anonymous4 = PROPSHEETHEADERW_V2_3 { hbmWatermark: bm_watermark };
+    hdr.Anonymous4 = PROPSHEETHEADERW_V2_3 { hbmWatermark: null_mut() };
     hdr.hplWatermark = null_mut();
-    hdr.Anonymous5 = PROPSHEETHEADERW_V2_4 { hbmHeader: bm_header };
+    hdr.Anonymous5 = PROPSHEETHEADERW_V2_4 { hbmHeader: null_mut() };
 
+    // comctl32 builds the sheet frame and the pages under different DPI contexts when the
+    // process is PerMonitorV2: the page ends up 1.25x the frame and everything on the
+    // right is clipped. Running the sheet under a single system-DPI context keeps the two
+    // in step.
+    let saved_ctx = unsafe { SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_SYSTEM_AWARE) };
+    let saved_dpi = dpi();
+    set_dpi(unsafe { GetDpiForSystem() });
     let ret = unsafe { PropertySheetW(&mut hdr) };
+    set_dpi(saved_dpi);
+    unsafe { SetThreadDpiAwarenessContext(saved_ctx) };
 
     STATE.with(|c| c.set(null_mut()));
     let done = unsafe { Box::from_raw(raw) };
     unsafe {
-        if !bm_watermark.is_null() {
-            DeleteObject(bm_watermark as *mut _);
-        }
-        if !bm_header.is_null() {
-            DeleteObject(bm_header as *mut _);
+        if !bmp.is_null() {
+            DeleteObject(bmp as _);
         }
     }
 
@@ -212,21 +226,103 @@ fn leak(s: &str) -> windows_sys::core::PCWSTR {
 
 type PageProc = unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> isize;
 
-fn page(id: i32, title: &'static str, subtitle: &'static str, hide_header: bool, proc_: PageProc) -> PROPSHEETPAGEW {
+fn page(id: i32, proc_: PageProc) -> PROPSHEETPAGEW {
     let mut p: PROPSHEETPAGEW = unsafe { std::mem::zeroed() };
     p.dwSize = std::mem::size_of::<PROPSHEETPAGEW>() as u32;
-    p.dwFlags = if hide_header { PSP_HIDEHEADER } else { PSP_USEHEADERTITLE | PSP_USEHEADERSUBTITLE };
+    p.dwFlags = 0;
     p.hInstance = hinst();
     p.Anonymous1 = PROPSHEETPAGEW_0 { pszTemplate: id as usize as *const u16 };
     p.pfnDlgProc = Some(proc_);
-    if !hide_header {
-        p.pszHeaderTitle = leak(title);
-        p.pszHeaderSubTitle = leak(subtitle);
-    }
     p
 }
 
+// ------------------------------------------------------------------ painting
+
+fn rgb(r: u8, g: u8, b: u8) -> u32 {
+    r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
+}
+
+/// The sheet keeps its classic size whatever the page template asks for, so the content
+/// is anchored to fixed offsets instead of the page width: comctl32 hands the page a
+/// width that is larger than the frame on 125-150 % scaling and anything past the frame
+/// is clipped.
+const CONTENT_X: i32 = 196;
+/// Visible height of a page inside the frame, in pixels.
+const PAGE_H: i32 = 330;
+const CONTENT_W: i32 = 300;
+
+fn content_x(_w: i32) -> i32 {
+    CONTENT_X
+}
+
+fn content_w(_w: i32) -> i32 {
+    CONTENT_W
+}
+
+unsafe fn fill(hdc: HDC, rc: &RECT, colour: u32) {
+    let br = CreateSolidBrush(colour);
+    FillRect(hdc, rc, br);
+    DeleteObject(br as _);
+}
+
+/// Paint the watermark strip plus an optional header title/subtitle.
+unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
+    let (cw, ht) = avail_size(h);
+    let all = RECT { left: 0, top: 0, right: cw, bottom: ht };
+    fill(hdc, &all, rgb(255, 255, 255));
+
+    let s = st();
+    if !s.bmp.is_null() {
+        let mem = CreateCompatibleDC(hdc);
+        let old = SelectObject(mem, s.bmp as _);
+        let strip = content_x(cw) - sc(6);
+        StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 164, 314, SRCCOPY);
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    }
+
+    let f = super::fonts();
+    let x = content_x(cw);
+    SetBkMode(hdc, TRANSPARENT as i32);
+    if !title.is_empty() {
+        SelectObject(hdc, f.big as _);
+        SetTextColor(hdc, rgb(28, 32, 36));
+        let t = w(title);
+        TextOutW(hdc, x, sc(10), t.as_ptr(), (t.len() - 1) as i32);
+        SelectObject(hdc, f.normal as _);
+        SetTextColor(hdc, rgb(96, 104, 112));
+        let t = w(subtitle);
+        TextOutW(hdc, x, sc(36), t.as_ptr(), (t.len() - 1) as i32);
+        let line = RECT { left: x, top: sc(HEADER_H), right: cw - sc(12), bottom: sc(HEADER_H) + 1 };
+        fill(hdc, &line, rgb(226, 230, 234));
+    }
+}
+
+/// Transparent background for labels and checkboxes drawn over the painted banner.
+unsafe fn on_ctlcolor(h: HWND, hdc: HDC, child: HWND, warn_id: u16) -> isize {
+    SetBkMode(hdc, TRANSPARENT as i32);
+    if warn_id != 0 && child == ctl(h, warn_id) {
+        SetTextColor(hdc, rgb(176, 0, 32));
+    }
+    GetStockObject(HOLLOW_BRUSH) as isize
+}
+
 // ------------------------------------------------------------------ helpers
+
+/// Usable area inside the wizard window. comctl32 sizes the page from the dialog
+/// template, which on 125-150 % scaling is wider than the sheet, so the layout is
+/// clamped to what the sheet actually shows.
+fn avail_size(h: HWND) -> (i32, i32) {
+    let (pw, ph) = client_size(h);
+    let root = unsafe { GetAncestor(h, GA_ROOT) };
+    if root.is_null() {
+        return (pw, ph);
+    }
+    let (rw, rh) = client_size(root);
+    let mut pt = POINT { x: 0, y: 0 };
+    unsafe { MapWindowPoints(h, root, &mut pt as *mut POINT, 1) };
+    ((rw - pt.x).min(pw), (rh - pt.y).min(ph))
+}
 
 fn ctl(h: HWND, id: u16) -> HWND {
     unsafe { GetDlgItem(h, id as i32) }
@@ -292,23 +388,22 @@ fn build_welcome(h: HWND) {
     label_id(
         h,
         ID_WELCOME_BODY,
-        "这个向导会分几步带你完成一件事：给图片嵌入可追溯的编号，\
+        "这个向导分几步带你完成一件事：给图片嵌入可追溯的编号，\
          或者检查一张图里有没有你自己的编号。\n\n\
-         所有步骤都可以随时按“上一步”返回修改。\n\n\
-         先确认一件事：你手上有密钥文件吗？密钥决定谁能读出图片里的编号，\
-         第一次使用时向导会帮你新建一把。",
+         每一步都可以用“上一步”返回修改。中途取消不会改动任何图片。\n\n\
+         接下来先确认你手上有没有密钥——没有也没关系，向导会帮你新建一把。",
     );
 }
 
 fn layout_welcome(h: HWND) {
-    let (w, ht) = client_size(h);
-    let left = sc(164) + sc(18);
-    let right = sc(18);
-    mv(ctl(h, ID_WELCOME_TITLE), left, sc(22), w - left - right, sc(34));
-    mv(ctl(h, ID_WELCOME_BODY), left, sc(64), w - left - right, ht - sc(84));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    mv(ctl(h, ID_WELCOME_TITLE), x, sc(20), cw, sc(34));
+    mv(ctl(h, ID_WELCOME_BODY), x, sc(62), cw, PAGE_H - sc(78));
 }
 
-unsafe extern "system" fn page_welcome(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
+unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
     match msg {
         WM_INITDIALOG => {
             build_welcome(h);
@@ -321,6 +416,11 @@ unsafe extern "system" fn page_welcome(h: HWND, msg: u32, _wp: WPARAM, lp: LPARA
             layout_welcome(h);
             1
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, "", "");
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
         WM_NOTIFY => {
             let nm = unsafe { &*(lp as *const NMHDR) };
             if nm.code == PSN_SETACTIVE {
@@ -342,11 +442,12 @@ fn build_mode(h: HWND) {
 }
 
 fn layout_mode(h: HWND) {
-    let (w, ht) = client_size(h);
-    let m = sc(12);
-    mv(ctl(h, ID_EMBED), m, m, w - 2 * m, sc(24));
-    mv(ctl(h, ID_DETECT), m, m + sc(30), w - 2 * m, sc(24));
-    mv(ctl(h, ID_MODE_HINT), m, ht - m - sc(20), w - 2 * m, sc(20));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    mv(ctl(h, ID_EMBED), x, sc(70), cw, sc(26));
+    mv(ctl(h, ID_DETECT), x, sc(100), cw, sc(26));
+    mv(ctl(h, ID_MODE_HINT), x, PAGE_H - sc(30), cw, sc(20));
 }
 
 unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) -> isize {
@@ -361,6 +462,11 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
             layout_mode(h);
             1
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, _wp as HDC, "选择任务", "你想给图片加水印，还是检查图片里有没有你的水印？");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, _wp as HDC, lp as HWND, 0),
         WM_NOTIFY => {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
@@ -391,33 +497,53 @@ unsafe extern "system" fn page_mode(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM) 
 // ------------------------------------------------------------------ page 202: key
 
 fn build_key(h: HWND) {
-    create_readonly(h, ID_KEY_INFO);
-    button(h, ID_KEY_NEW, "新建密钥…");
-    button(h, ID_KEY_PICK, "选择密钥文件…");
+    let lv = listview(h, ID_KEY_TABLE, true);
+    lv_column(lv, 0, "项目", 88, false);
+    lv_column(lv, 1, "内容", CONTENT_W - 88 - 24, false);
+    create(windows_sys::core::w!("BUTTON"), "创建新密钥…", (WS_TABSTOP | BS_DEFPUSHBUTTON as u32) as u32, 0, h, ID_KEY_NEW);
+    button(h, ID_KEY_PICK, "使用已有的密钥文件…");
+    button(h, ID_KEY_OPEN, "打开所在文件夹");
+    let warn = label_id(h, ID_KEY_WARN, "密钥决定谁能读出水印。请把它备份到安全的地方。");
+    set_font(warn, super::fonts().bold);
 }
 
 fn layout_key(h: HWND) {
-    let (w, ht) = client_size(h);
-    let m = sc(12);
-    mv(ctl(h, ID_KEY_INFO), m, m, w - 2 * m, ht - 2 * m - sc(34));
-    let bw = sc(120);
-    let by = ht - m - sc(28);
-    mv(ctl(h, ID_KEY_NEW), m, by, bw, sc(28));
-    mv(ctl(h, ID_KEY_PICK), m + bw + sc(8), by, bw + sc(26), sc(28));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    let warn_y = PAGE_H - 48;
+    let row2 = warn_y - 36;
+    let row1 = row2 - 32;
+    mv(ctl(h, ID_KEY_TABLE), x, 60, cw, (row1 - 8 - 60).max(60));
+    mv(ctl(h, ID_KEY_NEW), x, row1, cw, 28);
+    let half = (cw - 8) / 2;
+    mv(ctl(h, ID_KEY_PICK), x, row2, half, 28);
+    mv(ctl(h, ID_KEY_OPEN), x + half + 8, row2, half, 28);
+    mv(ctl(h, ID_KEY_WARN), x, warn_y, cw, 36);
 }
 
-fn key_info_text() -> String {
+/// Rows of the key table: file, fingerprint, registry and how many entries it holds.
+fn refresh_key(h: HWND) {
     let s = st();
-    match &s.key {
-        Some(k) => format!(
-            "当前密钥\n{}\n\n指纹 {}\n\n密钥决定谁能读出水印。请把它备份到安全的地方，并且不要分享——丢了密钥就再也检测不出自己的水印。",
-            s.cfg.key_path.display(),
-            keys::fingerprint(k)
-        ),
-        None => format!(
-            "还没有可用的密钥。\n\n默认位置：{}\n\n点下面的按钮新建一把，或者选择一个已有的密钥文件。",
-            s.cfg.key_path.display()
-        ),
+    let loaded = s.key.is_some();
+    let fp = s.key.as_ref().map(|k| keys::fingerprint(k)).unwrap_or_else(|| "—".into());
+    let path = s.cfg.key_path.display().to_string();
+    let exists = s.cfg.key_path.exists();
+    let (reg_entries, reg_note) = match Registry::open(&s.cfg.registry_dir) {
+        Ok(r) => (r.entries.len(), String::new()),
+        Err(e) => (0, format!("（{e:#}）")),
+    };
+    let rows: [(&str, String); 5] = [
+        ("状态", if loaded { "已加载".into() } else { "未加载，需要新建或选择".into() }),
+        ("密钥文件", if exists { path } else { format!("{path}（不存在）") }),
+        ("指纹", fp),
+        ("登记表", format!("{}{reg_note}", s.cfg.registry_dir.display())),
+        ("登记条数", reg_entries.to_string()),
+    ];
+    let lv = ctl(h, ID_KEY_TABLE);
+    lv_clear(lv);
+    for (k, v) in rows.iter() {
+        lv_add(lv, &[k, v.as_str()], 0);
     }
 }
 
@@ -446,6 +572,11 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             layout_key(h);
             return 1;
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, "密钥", "这一把密钥决定谁能读出你的水印。");
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, ID_KEY_WARN),
         WM_COMMAND => {
             match (wp & 0xffff) as u16 {
                 ID_KEY_NEW => {
@@ -469,7 +600,8 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     match res {
                         Ok(()) => {
                             load_key_from_settings();
-                            set_text(ctl(h, ID_KEY_INFO), &key_info_text());
+                            refresh_key(h);
+                            info(h, &format!("已新建密钥：\n{}\n\n请立刻备份这个文件。丢了它，你再也读不出自己的水印。", path.display()));
                         }
                         Err(e) => error(h, &format!("新建密钥失败：{e}")),
                     }
@@ -482,10 +614,18 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                                 let s = st();
                                 s.key = Some(k);
                                 s.cfg.key_path = p;
-                                set_text(ctl(h, ID_KEY_INFO), &key_info_text());
+                                refresh_key(h);
                             }
                             Err(e) => error(h, &format!("这不是有效的密钥文件：{e}")),
                         }
+                    }
+                    return 1;
+                }
+                ID_KEY_OPEN => {
+                    let dir = st().cfg.key_path.parent().map(|p| p.to_path_buf());
+                    if let Some(d) = dir {
+                        let _ = std::fs::create_dir_all(&d);
+                        shell_open(&d.display().to_string());
                     }
                     return 1;
                 }
@@ -500,7 +640,7 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
                     if st().key.is_none() {
                         load_key_from_settings();
                     }
-                    set_text(ctl(h, ID_KEY_INFO), &key_info_text());
+                    refresh_key(h);
                     set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
                     return 1;
                 }
@@ -523,21 +663,22 @@ unsafe extern "system" fn page_key(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
 
 fn build_files(h: HWND) {
     let lv = listview(h, ID_LIST, true);
-    lv_column(lv, 0, "文件", sc(260), false);
+    lv_column(lv, 0, "文件", sc(300), false);
     button(h, ID_ADD_FILES, "添加图片…");
     button(h, ID_ADD_FOLDER, "添加文件夹…");
     button(h, ID_REMOVE, "移除所选");
 }
 
 fn layout_files(h: HWND) {
-    let (w, ht) = client_size(h);
-    let m = sc(12);
-    mv(ctl(h, ID_LIST), m, m, w - 2 * m, ht - 2 * m - sc(34));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    let by = PAGE_H - sc(34);
+    mv(ctl(h, ID_LIST), x, sc(66), cw, (by - sc(8) - sc(66)).max(sc(60)));
     let bw = sc(104);
-    let by = ht - m - sc(28);
-    mv(ctl(h, ID_ADD_FILES), m, by, bw, sc(28));
-    mv(ctl(h, ID_ADD_FOLDER), m + bw + sc(8), by, bw + sc(18), sc(28));
-    mv(ctl(h, ID_REMOVE), m + 2 * (bw + sc(8)) + sc(12), by, bw, sc(28));
+    mv(ctl(h, ID_ADD_FILES), x, by, bw, sc(28));
+    mv(ctl(h, ID_ADD_FOLDER), x + bw + sc(8), by, bw + sc(18), sc(28));
+    mv(ctl(h, ID_REMOVE), x + 2 * (bw + sc(8)) + sc(12), by, bw, sc(28));
 }
 
 fn refresh_files(h: HWND) {
@@ -561,6 +702,11 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             layout_files(h);
             return 1;
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, "选择图片", "可以一次加入多张，处理顺序与列表一致。");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
         WM_COMMAND => {
             match (wp & 0xffff) as u16 {
                 ID_ADD_FILES => {
@@ -645,25 +791,26 @@ fn build_embed(h: HWND) {
 }
 
 fn layout_embed(h: HWND) {
-    let (w, _ht) = client_size(h);
-    let m = sc(12);
-    let row = sc(28);
-    let mut y = m;
-    mv(ctl(h, 1680), m, y + sc(4), sc(36), sc(18));
-    mv(ctl(h, ID_STRENGTH), m + sc(40), y, w - 2 * m - sc(100), row);
-    mv(ctl(h, ID_STRENGTH_LABEL), w - m - sc(52), y + sc(4), sc(52), sc(18));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    let row = sc(30);
+    let mut y = sc(68);
+    mv(ctl(h, 1680), x, y + sc(6), sc(40), sc(18));
+    mv(ctl(h, ID_STRENGTH), x + sc(44), y, cw - sc(100), row);
+    mv(ctl(h, ID_STRENGTH_LABEL), x + cw - sc(52), y + sc(6), sc(52), sc(18));
     y += row;
-    mv(ctl(h, 1681), m, y + sc(4), sc(36), sc(18));
-    mv(ctl(h, ID_FORMAT), m + sc(40), y, sc(84), sc(200));
-    mv(ctl(h, 1682), m + sc(140), y + sc(4), sc(36), sc(18));
-    mv(ctl(h, ID_QUALITY), m + sc(178), y, sc(56), sc(200));
+    mv(ctl(h, 1681), x, y + sc(6), sc(40), sc(18));
+    mv(ctl(h, ID_FORMAT), x + sc(44), y, sc(84), sc(200));
+    mv(ctl(h, 1682), x + sc(140), y + sc(6), sc(40), sc(18));
+    mv(ctl(h, ID_QUALITY), x + sc(180), y, sc(56), sc(200));
     y += row;
-    mv(ctl(h, 1683), m, y + sc(4), sc(64), sc(18));
-    mv(ctl(h, ID_OUTDIR), m + sc(68), y, w - 2 * m - sc(146), sc(24));
-    mv(ctl(h, ID_BROWSE), w - m - sc(70), y, sc(70), sc(26));
+    mv(ctl(h, 1683), x, y + sc(6), sc(64), sc(18));
+    mv(ctl(h, ID_OUTDIR), x + sc(68), y, cw - sc(146), sc(24));
+    mv(ctl(h, ID_BROWSE), x + cw - sc(70), y, sc(70), sc(26));
     y += row;
-    mv(ctl(h, 1684), m, y + sc(4), sc(64), sc(18));
-    mv(ctl(h, ID_CHANNEL), m, y + sc(22), w - 2 * m, sc(24));
+    mv(ctl(h, 1684), x, y + sc(6), sc(64), sc(18));
+    mv(ctl(h, ID_CHANNEL), x, y + sc(24), cw, sc(24));
 }
 
 unsafe extern "system" fn page_embed(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -678,6 +825,11 @@ unsafe extern "system" fn page_embed(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             layout_embed(h);
             return 1;
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, "加水印设置", "强度、格式与输出位置。");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
         WM_COMMAND => {
             match (wp & 0xffff) as u16 {
                 ID_BROWSE => {
@@ -740,11 +892,12 @@ fn build_detect(h: HWND) {
 }
 
 fn layout_detect(h: HWND) {
-    let (w, _ht) = client_size(h);
-    let m = sc(12);
-    let mut y = m;
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    let mut y = sc(72);
     for id in [ID_OPT_AFFINE, ID_OPT_PHOTO, ID_OPT_CONTENT, ID_OPT_STRICT] {
-        mv(ctl(h, id), m, y, w - 2 * m, sc(22));
+        mv(ctl(h, id), x, y, cw, sc(24));
         y += sc(30);
     }
 }
@@ -761,6 +914,11 @@ unsafe extern "system" fn page_detect(h: HWND, msg: u32, _wp: WPARAM, lp: LPARAM
             layout_detect(h);
             return 1;
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, _wp as HDC, "检测选项", "按需要开启更费时的步骤。");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, _wp as HDC, lp as HWND, 0),
         WM_NOTIFY => {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
@@ -796,11 +954,12 @@ fn build_run(h: HWND) {
 }
 
 fn layout_run(h: HWND) {
-    let (w, ht) = client_size(h);
-    let m = sc(12);
-    mv(ctl(h, ID_PROGRESS), m, m, w - 2 * m, sc(16));
-    mv(ctl(h, ID_STATUS), m, m + sc(22), w - 2 * m, sc(18));
-    mv(ctl(h, ID_RESULT), m, m + sc(46), w - 2 * m, ht - 2 * m - sc(52));
+    let (w, _ht) = avail_size(h);
+    let x = content_x(w);
+    let cw = content_w(w);
+    mv(ctl(h, ID_PROGRESS), x, sc(70), cw, sc(16));
+    mv(ctl(h, ID_STATUS), x, sc(92), cw, sc(18));
+    mv(ctl(h, ID_RESULT), x, sc(114), cw, (PAGE_H - sc(114) - sc(12)).max(sc(50)));
 }
 
 fn start_run(h: HWND) {
@@ -980,6 +1139,11 @@ unsafe extern "system" fn page_run(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) ->
             layout_run(h);
             return 1;
         }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, "执行", "完成后用“完成”关闭向导。");
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
         WM_TIMER => {
             if wp == TIMER_RUN {
                 drain_run(h);
