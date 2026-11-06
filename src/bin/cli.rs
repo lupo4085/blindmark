@@ -42,6 +42,9 @@ enum Cmd {
         /// Do not create a folder per recipient; add the name to the file name instead.
         #[arg(long)]
         flat: bool,
+        /// Skip the RFC 3161 timestamp for this batch (on by default).
+        #[arg(long)]
+        no_timestamp: bool,
     },
     /// Check images for your watermark
     Detect {
@@ -106,7 +109,7 @@ fn main() -> Result<()> {
             }
             println!("wrote {} (fingerprint {}) — back it up, never share it", key.display(), keys::fingerprint(&k));
         }
-        Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat } => {
+        Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat, no_timestamp } => {
             let k = read_key(&key)?;
             let mut reg = Registry::open(&registry)?;
             reg.check_key(&k)?;
@@ -127,9 +130,18 @@ fn main() -> Result<()> {
                     strength,
                     per_recipient_dir: !flat,
                     batch_id: Some(batch_id()),
+                    tsa: if no_timestamp { None } else { Some(blindmark::timestamp::DEFAULT_TSA.to_string()) },
                 };
                 let batch = opts.batch_id.clone();
-                for c in distribute(&inputs, &targets, &k, &mut reg, &opts)? {
+                let res = distribute(&inputs, &targets, &k, &mut reg, &opts)?;
+                if let Some(st) = &res.stamp {
+                    if st.ok {
+                        eprintln!("timestamp ok: {} (digest {})", st.dir.display(), st.digest);
+                    } else {
+                        eprintln!("timestamp failed: {} — {}", st.dir.display(), st.error.as_deref().unwrap_or("unknown"));
+                    }
+                }
+                for c in res.copies {
                     println!(
                         "{}",
                         serde_json::json!({

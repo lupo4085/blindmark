@@ -4,6 +4,7 @@ use anyhow::Result;
 use std::path::{Path, PathBuf};
 
 use crate::registry::{load_image, save_image, Registry};
+use crate::timestamp::{self, Manifest, ManifestCopy};
 use crate::wm;
 use crate::unique_output_path;
 
@@ -25,6 +26,8 @@ pub struct DistOpts {
     pub strength: f32,
     pub per_recipient_dir: bool,
     pub batch_id: Option<String>,
+    /// When set, the batch manifest is sent to this TSA for a trusted timestamp.
+    pub tsa: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -33,6 +36,14 @@ pub struct Copy {
     pub recipient: String,
     pub path: PathBuf,
     pub psnr: f64,
+    pub source: String,
+    pub sha256_marked: String,
+}
+
+/// Copies produced by a run, plus the timestamp record when one was requested.
+pub struct DistResult {
+    pub copies: Vec<Copy>,
+    pub stamp: Option<timestamp::Stamp>,
 }
 
 fn folder_name(name: &str) -> String {
@@ -44,7 +55,7 @@ fn folder_name(name: &str) -> String {
 }
 
 /// Embed one copy per (file, target). Returns the copies in processing order.
-pub fn distribute(files: &[PathBuf], targets: &[Target], key: &[u8], reg: &mut Registry, o: &DistOpts) -> Result<Vec<Copy>> {
+pub fn distribute(files: &[PathBuf], targets: &[Target], key: &[u8], reg: &mut Registry, o: &DistOpts) -> Result<DistResult> {
     let mut out = Vec::new();
     for f in files {
         let original = load_image(f)?;
@@ -82,8 +93,36 @@ pub fn distribute(files: &[PathBuf], targets: &[Target], key: &[u8], reg: &mut R
                 Some(path.display().to_string()),
                 Some(&meta),
             )?;
-            out.push(Copy { id, recipient: t.name.clone(), path, psnr });
+            let mut h = sha2::Sha256::new();
+            use sha2::Digest as _;
+            h.update(&marked.data);
+            let sha = hex::encode(h.finalize());
+            let source_name = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
+            out.push(Copy { id, recipient: t.name.clone(), path, psnr, source: source_name, sha256_marked: sha });
         }
     }
-    Ok(out)
+
+    let stamp = match (&o.tsa, &o.batch_id) {
+        (Some(url), Some(batch)) => {
+            let manifest = Manifest {
+                format: timestamp::MANIFEST_FORMAT.to_string(),
+                batch_id: batch.clone(),
+                created_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                key_fingerprint: crate::keys::fingerprint(key),
+                copies: out
+                    .iter()
+                    .map(|c| ManifestCopy {
+                        id: format!("0x{:08x}", c.id),
+                        recipient_id: None,
+                        recipient_name: Some(c.recipient.clone()),
+                        source: c.source.clone(),
+                        sha256_marked: c.sha256_marked.clone(),
+                    })
+                    .collect(),
+            };
+            Some(timestamp::stamp_batch(&reg.dir, &manifest, url)?)
+        }
+        _ => None,
+    };
+    Ok(DistResult { copies: out, stamp })
 }

@@ -4,6 +4,7 @@ pub mod features;
 pub mod distribute;
 pub mod imgproc;
 pub mod recipients;
+pub mod timestamp;
 pub mod keys;
 pub mod registry;
 pub mod wm;

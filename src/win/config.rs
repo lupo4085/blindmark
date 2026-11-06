@@ -34,6 +34,10 @@ pub struct Settings {
     pub window: Option<[i32; 5]>,
     /// Read an image from the clipboard when switching to the Detect tab.
     pub auto_clipboard: bool,
+    /// Request an RFC 3161 timestamp for every distribution batch.
+    pub timestamp: bool,
+    /// Time-Stamp Authority endpoint.
+    pub tsa_url: String,
 }
 
 pub fn app_dir() -> PathBuf {
@@ -63,6 +67,8 @@ impl Default for Settings {
             remember_window: true,
             window: None,
             auto_clipboard: false,
+            timestamp: true,
+            tsa_url: blindmark::timestamp::DEFAULT_TSA.to_string(),
         }
     }
 }
