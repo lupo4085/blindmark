@@ -27,7 +27,7 @@ fn main() {
 
     if env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let ver = env::var("CARGO_PKG_VERSION").unwrap();
-        let comma = ver.split('.').chain(std::iter::once("0")).take(4).collect::<Vec<_>>().join(",");
+        let comma = version_words(&ver).join(",");
         let fwd = |p: PathBuf| p.display().to_string().replace('\\', "/");
         let rc = fs::read_to_string(root.join("assets/blindmark.rc.in"))
             .unwrap()
@@ -35,10 +35,34 @@ fn main() {
             .replace("@MANIFEST@", &fwd(root.join("assets/blindmark.manifest")))
             .replace("@VER_COMMA@", &comma)
             .replace("@VER@", &ver);
+        // rc.exe takes one to four comma-separated 16-bit words here, and reports a fifth
+        // one as a bogus "unrecognized VERSIONINFO field" on the first field line.
+        for field in ["FILEVERSION", "PRODUCTVERSION"] {
+            let value = rc
+                .lines()
+                .find_map(|l| l.trim_start().strip_prefix(field))
+                .map(|rest| rest.trim())
+                .unwrap_or_else(|| panic!("{field} is missing from assets/blindmark.rc.in"));
+            let words = value.split(',').count();
+            assert!(words <= 4, "{field} {value} has {words} words; rc.exe accepts at most 4");
+        }
         let rc_path = out.join("blindmark.rc");
         fs::write(&rc_path, rc).unwrap();
         embed_resource::compile_for(&rc_path, ["blindmark"], embed_resource::NONE).manifest_required().unwrap();
     }
+}
+
+/// `FILEVERSION`/`PRODUCTVERSION` words: at most four 16-bit numbers from `major.minor.patch`.
+fn version_words(ver: &str) -> Vec<String> {
+    let mut words: Vec<u32> = ver
+        .split(['-', '+'])
+        .next()
+        .unwrap_or("0")
+        .split('.')
+        .map(|s| s.parse().unwrap_or(0))
+        .collect();
+    words.resize(4, 0);
+    words.iter().map(|w| w.to_string()).collect()
 }
 
 /// "name version — licence" for every registry dependency in Cargo.lock.
