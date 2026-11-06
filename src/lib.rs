@@ -1,7 +1,9 @@
 //! blindmark — keyed, content-adaptive, screenshot-tolerant blind image watermark.
 pub mod affine;
 pub mod features;
+pub mod distribute;
 pub mod imgproc;
+pub mod recipients;
 pub mod keys;
 pub mod registry;
 pub mod wm;
