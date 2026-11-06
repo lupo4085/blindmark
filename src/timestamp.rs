@@ -4,15 +4,13 @@
 //! Time-Stamp Authority. The signed reply proves that the manifest — and therefore every
 //! copy id and hash in it — existed at that moment. Only the hash leaves the machine.
 //!
-//! The HTTP call goes through `post_tsa`, which shells out to the system `curl`. That keeps
-//! the project dependency-free; swapping in an HTTP crate later means replacing one
-//! function.
+//! The HTTP call goes through `post_tsa`, implemented with `ureq` over rustls. Only the
+//! manifest hash is sent; images and keys never leave the machine.
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 pub const MANIFEST_FORMAT: &str = "blindmark/batch/v1";
 pub const DEFAULT_TSA: &str = "https://freetsa.org/tsr";
@@ -94,35 +92,19 @@ pub fn stamp_batch(registry_dir: &Path, manifest: &Manifest, tsa_url: &str) -> R
 
 /// POST the DER request to the TSA and return the DER reply.
 fn post_tsa(url: &str, body: &[u8]) -> Result<Vec<u8>> {
-    let tmp = std::env::temp_dir().join(format!("blindmark-tsq-{}.der", std::process::id()));
-    let out = std::env::temp_dir().join(format!("blindmark-tsr-{}.der", std::process::id()));
-    std::fs::write(&tmp, body)?;
-    let res = Command::new("curl")
-        .args(["--silent", "--show-error", "--max-time", "40", "-H", "Content-Type: application/timestamp-query", "-H", "Accept: application/timestamp-reply", "--data-binary"])
-        .arg(format!("@{}", tmp.display()))
-        .arg("-o")
-        .arg(&out)
-        .arg(url)
-        .output();
-    let _ = std::fs::remove_file(&tmp);
-    match res {
-        Ok(o) if o.status.success() => {
-            let reply = std::fs::read(&out).context("时间戳服务没有返回数据")?;
-            let _ = std::fs::remove_file(&out);
-            if reply.is_empty() {
-                bail!("时间戳服务返回空响应");
-            }
-            Ok(reply)
-        }
-        Ok(o) => {
-            let _ = std::fs::remove_file(&out);
-            bail!("curl 调用失败：{}", String::from_utf8_lossy(&o.stderr).trim())
-        }
-        Err(e) => {
-            let _ = std::fs::remove_file(&out);
-            bail!("无法执行 curl：{e}")
-        }
+    use std::io::Read;
+
+    let resp = ureq::post(url)
+        .set("Content-Type", "application/timestamp-query")
+        .set("Accept", "application/timestamp-reply")
+        .send_bytes(body)
+        .map_err(|e| anyhow::anyhow!("时间戳服务请求失败：{e}"))?;
+    let mut buf = Vec::new();
+    resp.into_reader().read_to_end(&mut buf).context("读取时间戳响应失败")?;
+    if buf.is_empty() {
+        bail!("时间戳服务返回空响应");
     }
+    Ok(buf)
 }
 
 // ------------------------------------------------------------------ DER
