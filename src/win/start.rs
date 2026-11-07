@@ -126,6 +126,8 @@ const ID_C3_SUPP: u16 = 2022;
 const ID_C3_EXPORT: u16 = 2023;
 const ID_C3_REG: u16 = 2024;
 const ID_C3_TAB: u16 = 2025;
+const ID_C3_NEWKEY: u16 = 2026;
+const ID_C3_BACKUP: u16 = 2027;
 
 /// `SetWindowLongPtrW` takes an `i32` index; windows-sys exposes `DWLP_MSGRESULT` as `u32`.
 const DWLP_MSGRESULT: i32 = windows_sys::Win32::UI::WindowsAndMessaging::DWLP_MSGRESULT as i32;
@@ -1259,6 +1261,7 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                                 if let Some(s) = st(h) {
                                     s.new_key = Some(k.clone());
                                     s.created_key_path = Some(path.clone());
+                                    s.key_choice = KeyChoice::Existing(Some(path.clone()));
                                 }
                                 (k, path)
                             }
@@ -1381,8 +1384,11 @@ unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
                     if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
                         match std::fs::copy(&key_path, &p) {
-                            Ok(_) => info(h, &format!("密钥已备份到 {}", p.display())),
-                            Err(e) => error(h, &format!("备份失败：{e:#}")),
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
                         }
                     }
                     1
@@ -1393,7 +1399,10 @@ unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                         let dest = d.join(format!("blindmark-registry-backup-{}", chrono::Local::now().format("%Y%m%d")));
                         match jobs::copy_dir(&reg_dir, &dest) {
                             Ok(n) => info(h, &format!("登记表已备份到 {}（{n} 个文件）。", dest.display())),
-                            Err(e) => error(h, &e.message),
+                            Err(e) => {
+                                eprintln!("{}", e.detail);
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
                         }
                     }
                     1
@@ -2076,8 +2085,11 @@ unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
                     if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
                         match std::fs::copy(&key_path, &p) {
-                            Ok(_) => info(h, &format!("密钥已备份到 {}", p.display())),
-                            Err(e) => error(h, &format!("备份失败：{e:#}")),
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
                         }
                     }
                     1
@@ -2585,6 +2597,8 @@ fn build_c3(h: HWND) {
     button(h, ID_C3_EXPORT, "导出检测报告…");
     button(h, ID_C3_REG, "在登记表中查看");
     button(h, ID_C3_TAB, "转到“检测”选项卡");
+    label_id(h, ID_C3_NEWKEY, E4_NEWKEY);
+    button(h, ID_C3_BACKUP, "备份密钥…");
     label_id(h, 2030, C3_HINT);
     refresh_c3(h);
 }
@@ -2602,6 +2616,9 @@ fn refresh_c3(h: HWND) {
         lv_add(lv, &[name, &short], 0);
     }
     show(ctl(h, ID_C3_SUPP), notfound);
+    let created = s.created_key_path.is_some();
+    show(ctl(h, ID_C3_NEWKEY), created);
+    show(ctl(h, ID_C3_BACKUP), created);
     if let Some((name, r, err)) = s.check_results.first() {
         set_text(ctl(h, ID_C3_DETAIL), &c3_detail(name, r, err));
     } else {
@@ -2614,13 +2631,15 @@ fn layout_c3(h: HWND) {
     let x = content_x(w);
     let cw = content_w(h);
     let by = ht - sc(16) - sc(28);
-    mv(ctl(h, ID_C3_LIST), x, 76, cw, sc(90));
-    mv(ctl(h, ID_C3_DETAIL), x, 174, cw, sc(70));
-    mv(ctl(h, ID_C3_SUPP), x, 250, cw, sc(34));
+    mv(ctl(h, ID_C3_LIST), x, 74, cw, sc(76));
+    mv(ctl(h, ID_C3_DETAIL), x, 156, cw, sc(44));
+    mv(ctl(h, ID_C3_SUPP), x, 206, cw, sc(28));
+    mv(ctl(h, ID_C3_NEWKEY), x, by - sc(70), cw - sc(120), sc(20));
+    mv(ctl(h, ID_C3_BACKUP), x + cw - sc(110), by - sc(74), sc(110), sc(26));
     mv(ctl(h, ID_C3_EXPORT), x, by, sc(130), sc(28));
     mv(ctl(h, ID_C3_REG), x + sc(138), by, sc(140), sc(28));
-    mv(ctl(h, 2030), x, by - sc(22), cw - sc(150), sc(20));
-    mv(ctl(h, ID_C3_TAB), x + cw - sc(150), by - sc(26), sc(150), sc(28));
+    mv(ctl(h, 2030), x, by - sc(24), cw - sc(150), sc(20));
+    mv(ctl(h, ID_C3_TAB), x + cw - sc(150), by - sc(28), sc(150), sc(28));
 }
 
 fn c3_export(h: HWND) {
@@ -2685,6 +2704,7 @@ unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let title = match best {
                 0 => "这张图片是你的",
                 1 => "找到了你的水印，但画面对不上",
+                2 => "可能有你的水印，但读不出编号",
                 _ => "没有找到你的水印",
             };
             paint_banner(h, wp as HDC, title, "");
@@ -2698,6 +2718,20 @@ unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             match (wp & 0xffff) as u16 {
                 ID_C3_EXPORT => {
                     c3_export(h);
+                    1
+                }
+                ID_C3_BACKUP => {
+                    let key_path = st(h).map(|s| s.ctx.cfg.key_path.clone()).unwrap_or_default();
+                    let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
+                    if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
+                        match std::fs::copy(&key_path, &p) {
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
+                        }
+                    }
                     1
                 }
                 ID_C3_REG => {
