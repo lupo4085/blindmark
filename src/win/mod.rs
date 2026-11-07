@@ -247,9 +247,6 @@ pub fn run() {
     a.select_tab(start.clamp(0, 3) as usize);
     a.layout();
     unsafe { UpdateWindow(hwnd) };
-    if config::Settings::is_first_run() {
-        a.open_wizard();
-    }
 
     let accel = build_accelerators();
     unsafe {

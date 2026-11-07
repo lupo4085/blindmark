@@ -124,7 +124,7 @@ fn st<'a>() -> &'a mut State {
 
 /// Run the wizard modally. Returns true when the registry was written to.
 pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
-    let mut boxed = Box::new(State {
+    let raw: *mut State = Box::into_raw(Box::new(State {
         mode: None,
         cfg: cfg.clone(),
         key: None,
@@ -141,8 +141,7 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
         rx: None,
         bmp: null_mut(),
         white: null_mut(),
-    });
-    let raw: *mut State = &mut *boxed;
+    }));
     STATE.with(|c| c.set(raw));
 
     let mut pages = vec![
@@ -202,6 +201,8 @@ pub fn open(owner: HWND, cfg: &mut Settings) -> bool {
         cfg.photo = done.cfg.photo;
         cfg.content = done.cfg.content;
         cfg.strict = done.cfg.strict;
+        cfg.key_path = done.cfg.key_path.clone();
+        cfg.registry_dir = done.cfg.registry_dir.clone();
         cfg.save();
     }
     accepted && done.ok > 0
@@ -789,20 +790,22 @@ unsafe extern "system" fn page_files(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
 
 fn build_embed(h: HWND) {
     label_id(h, 1680, "强度");
-    let tb = trackbar(h, ID_STRENGTH, 5, 60);
+    let tb = trackbar(h, ID_STRENGTH, 15, 40);
     tb_set(tb, (st().cfg.strength * 10.0) as i32);
-    label_id(h, ID_STRENGTH_LABEL, "");
+    label_id(h, ID_STRENGTH_LABEL, &format!("{:.1}", st().cfg.strength));
     label_id(h, 1681, "格式");
     let fmt = combo_list(h, ID_FORMAT);
     cb_add(fmt, "PNG");
     cb_add(fmt, "JPEG");
-    cb_set_sel(fmt, 0);
+    cb_set_sel(fmt, if st().cfg.jpeg { 1 } else { 0 });
     label_id(h, 1682, "质量");
     let q = combo_list(h, ID_QUALITY);
     for v in (60..=100).step_by(5) {
         cb_add(q, &v.to_string());
     }
-    cb_set_sel(q, 4);
+    let quality = st().cfg.jpeg_quality as i32;
+    let sel = (60..=100).step_by(5).position(|v| v == quality).map(|i| i as i32).unwrap_or(7);
+    cb_set_sel(q, sel);
     label_id(h, 1683, "输出文件夹");
     edit(h, ID_OUTDIR, "");
     button(h, ID_BROWSE, "浏览…");
@@ -1039,6 +1042,10 @@ fn start_run(h: HWND) {
                     let _ = tx.send(Msg::Fatal("登记表无法打开。".into()));
                     return;
                 };
+                if let Err(e) = reg.check_key(&key) {
+                    let _ = tx.send(Msg::Fatal(format!("这个登记表属于另一把密钥，不能和当前密钥一起使用。（{e:#}）")));
+                    return;
+                }
                 for f in &files {
                     if cancel.load(Ordering::SeqCst) {
                         break;
@@ -1073,7 +1080,7 @@ fn start_run(h: HWND) {
                     let name = f.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
                     match load_image(f) {
                         Ok(img) => {
-                            let rep = blindmark::detect_image(&img, &key, reg.as_ref(), known.as_ref(), Some(&thumbs));
+                            let rep = blindmark::detect_image_opts(&img, &key, reg.as_ref(), known.as_ref(), Some(&thumbs), &cfg.detect_options());
                             let _ = tx.send(Msg::Item { ok: rep.det.found, text: describe(&name, &rep) });
                         }
                         Err(e) => {
