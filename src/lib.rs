@@ -2,6 +2,7 @@
 pub mod affine;
 pub mod features;
 pub mod imgproc;
+pub mod jobs;
 pub mod keys;
 pub mod registry;
 pub mod wm;

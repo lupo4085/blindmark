@@ -10,8 +10,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::BN_CLICKED;
 use super::controls::{banner, banner_set, image_box, image_hint, image_set, Tone};
 use super::util::*;
 use super::{post, App, WorkerMsg, TAB_REG};
-use blindmark::registry::{load_image, save_image, Registry, RgbImageBuf};
-use blindmark::{keys, wm, Report};
+use blindmark::jobs::DetectContext;
+use blindmark::registry::{load_image, save_image, RgbImageBuf};
+use blindmark::{keys, Report};
 
 const OPEN: u16 = 1201;
 const PASTE: u16 = 1202;
@@ -225,14 +226,19 @@ fn start(a: &mut App, img: RgbImageBuf, source: Option<PathBuf>, label_text: Str
     let thumbs = a.thumbs.clone();
     std::thread::spawn(move || {
         let t0 = std::time::Instant::now();
-        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let reg = if use_reg { Registry::open(&regdir).ok() } else { None };
-            let ids = reg.as_ref().map(|r| r.ids()).unwrap_or_default();
-            let known = (!ids.is_empty()).then(|| wm::KnownIds::new(&key, ids));
-            blindmark::detect_image_opts(&img, &key, reg.as_ref(), known.as_ref(), reg.as_ref().map(|_| thumbs.as_ref()), &opts)
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<(Report, f64), blindmark::jobs::UserError> {
+            let ctx = DetectContext::open(if use_reg { Some(regdir.as_path()) } else { None }, &key)?;
+            let thumbs_arg = if ctx.registry().is_some() { Some(thumbs.as_ref()) } else { None };
+            let dr = ctx.detect(&img, &key, thumbs_arg, &opts);
+            Ok((dr.report, t0.elapsed().as_secs_f64()))
         }))
-        .map(|r| (r, t0.elapsed().as_secs_f64()))
-        .map_err(|_| "检测过程中出现内部错误".to_string());
+        .map_err(|_| "检测过程中出现内部错误".to_string())
+        .and_then(|r| {
+            r.map_err(|e| {
+                eprintln!("{}", e.detail);
+                e.message
+            })
+        });
         post(&tx, hw, WorkerMsg::Detect { token, res });
     });
 }
