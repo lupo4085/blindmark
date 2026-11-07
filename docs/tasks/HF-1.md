@@ -48,8 +48,9 @@ cfg.registry_dir = done.cfg.registry_dir.clone();
 - 质量下拉框：不要再固定选第 4 项。要选中和 `st().cfg.jpeg_quality` 相同的那一项（列表是 60、65 … 100，95 在列表里）。如果没有相同的，就选 95。
 
 ## 验收
-- [ ] `grep -n "from_raw\|into_raw\|boxed" src/win/wizard.rs`：`from_raw` 和 `into_raw` 各只有 1 处，`boxed` 一处都没有
-- [ ] 三条自检命令全部通过（见 AGENTS.md）
+- [ ] `grep -nw "from_raw\|into_raw\|boxed" src/win/wizard.rs`（注意要加 `-w`，按整词匹配）：`from_raw` 和 `into_raw` 各只有 1 处，`boxed` 变量一处都没有。`into_boxed_slice` 不算。
+- [ ] 两条自检命令都通过（见 AGENTS.md，不包括 fmt）
+- 已知并接受的警告：`Settings::is_first_run` 未使用（W-1 会处理），以及原有的 `unused variable: w`
 - [ ] 需要 Lupo 手动验证：
   - 打开向导后，分别用取消、✕、Esc、在执行页点完成这四种方式关闭，**每种都要单独重新打开一次再关**。关闭后主窗口都还在。
   - 第一次启动时不会自动弹出向导。

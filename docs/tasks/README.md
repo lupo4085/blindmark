@@ -11,6 +11,7 @@
 | W-3 | 加水印流程 E1–E4 | main | 卡未写 |
 | W-4 | 检查流程 C1–C3 | main | 卡未写 |
 | A-fix / D-fix | alpha 分支的修复 | alpha（变基到 main 之后） | 卡未写 |
+| FMT | 整个仓库 cargo fmt，并加 rustfmt.toml | main（等 alpha 合并之后） | 卡未写 |
 | W-5 | 分发流程 D1–D5 | main（等 alpha 合并之后） | 卡未写 |
 
 参考文档：
