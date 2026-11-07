@@ -9,6 +9,7 @@ mod detect;
 mod embed;
 mod regpage;
 mod setpage;
+mod start;
 mod util;
 mod wizard;
 
@@ -47,6 +48,7 @@ pub mod cmd {
     pub const DETECT_CLIP: u16 = 104;
     pub const EXIT: u16 = 105;
     pub const WIZARD: u16 = 106;
+    pub const START: u16 = 107;
     pub const REMOVE: u16 = 110;
     pub const CLEAR: u16 = 111;
     pub const COPY_REPORT: u16 = 112;
@@ -249,6 +251,12 @@ pub fn run() {
     a.layout();
     unsafe { UpdateWindow(hwnd) };
 
+    if a.cfg.show_start_wizard {
+        a.open_start();
+    } else if a.key.is_none() {
+        a.set_status("还没有密钥。按 F1 打开“开始使用”完成设置。");
+    }
+
     let accel = build_accelerators();
     unsafe {
         let mut msg: MSG = std::mem::zeroed();
@@ -341,6 +349,8 @@ fn build_menu() -> HMENU {
         add(tools, cmd::BACKUP_REG, "备份登记表…");
         add(tools, cmd::EXPORT_CSV, "导出登记表为 CSV…");
         let help = CreatePopupMenu();
+        add(help, cmd::START, "开始使用…\tF1");
+        sep(help);
         add(help, cmd::LICENSE, "许可证…");
         sep(help);
         add(help, cmd::ABOUT, "关于 blindmark(&A)…");
@@ -363,6 +373,7 @@ fn build_accelerators() -> HACCEL {
         ACCEL { fVirt: c | FSHIFT as u8, key: b'C' as u16, cmd: cmd::COPY_REPORT },
         ACCEL { fVirt: v, key: VK_DELETE, cmd: cmd::REMOVE },
         ACCEL { fVirt: v, key: VK_F5, cmd: cmd::REFRESH },
+        ACCEL { fVirt: v, key: VK_F1, cmd: cmd::START },
     ];
     for (i, id) in [cmd::TAB_EMBED, cmd::TAB_DETECT, cmd::TAB_REG, cmd::TAB_SET].into_iter().enumerate() {
         t.push(ACCEL { fVirt: c, key: b'1' as u16 + i as u16, cmd: id });
@@ -626,6 +637,26 @@ impl App {
         self.set_status(if changed { "向导完成，登记表已更新" } else { "向导已结束" });
     }
 
+    /// Run the new setup wizard (W-1) and apply the small piece of state it returns.
+    pub fn open_start(&mut self) {
+        let ctx = start::WizardContext {
+            cfg: self.cfg.clone(),
+            key: self.key.clone(),
+            embed_files: embed::files(self),
+        };
+        let result = start::run(self.hwnd, ctx);
+        if result.show_on_start != self.cfg.show_start_wizard {
+            self.cfg.show_start_wizard = result.show_on_start;
+            self.cfg.save();
+        }
+        self.load_key_and_registry(false);
+        match result.outcome {
+            start::WizardOutcome::Closed => {}
+            // TODO(W-2/W-3): 接上 SettingsChanged / ShowTab / ShowInRegistry
+            _ => {}
+        }
+    }
+
     pub fn export_csv(&mut self) {
         let Some(r) = &self.reg else {
             warn(self.hwnd, "登记表当前不可用。");
@@ -662,6 +693,7 @@ impl App {
                 PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
             },
             cmd::WIZARD => self.open_wizard(),
+            cmd::START => self.open_start(),
             cmd::REMOVE => {
                 if self.cur == TAB_EMBED {
                     embed::remove_selected(self);

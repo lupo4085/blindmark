@@ -103,7 +103,10 @@ fn classify(e: &anyhow::Error, name: &str, out_dir: &Path) -> UserError {
             }
         }
         if let Some(io) = cause.downcast_ref::<std::io::Error>() {
-            if io.kind() == std::io::ErrorKind::PermissionDenied || !matches!(io.kind(), std::io::ErrorKind::NotFound) {
+            if matches!(
+                io.kind(),
+                std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::ReadOnlyFilesystem | std::io::ErrorKind::StorageFull
+            ) {
                 return UserError {
                     message: format!("无法保存到 {}。请换一个文件夹，或检查这个文件夹是否只读。", out_dir.display()),
                     detail,
@@ -139,11 +142,18 @@ pub fn run_embed(
             break;
         }
         on_event(EmbedEvent::Running { index });
+        let name = file_name(path);
         let out_dir = job.out_dir.clone().unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
         let output = crate::unique_output_path(&out_dir, path, &job.suffix, job.jpeg_quality.is_some());
-        let result = crate::embed_file(path, &output, key, &mut reg, job.strength, job.channel.clone(), job.jpeg_quality)
-            .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone() })
-            .map_err(|e| classify(&e, &file_name(path), &out_dir));
+        let result = match std::fs::File::open(path) {
+            Ok(_) => crate::embed_file(path, &output, key, &mut reg, job.strength, job.channel.clone(), job.jpeg_quality)
+                .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone() })
+                .map_err(|e| classify(&e, &name, &out_dir)),
+            Err(e) => Err(UserError {
+                message: format!("无法打开 {name}：文件可能已损坏，或者不是支持的图片格式。"),
+                detail: format!("{e:#}"),
+            }),
+        };
         if result.is_ok() {
             summary.ok += 1;
         } else {
@@ -354,6 +364,29 @@ mod tests {
             Ok(_) => panic!("a text file named x.png must fail"),
         }
         assert!(results[1].1.is_ok());
+    }
+
+    #[test]
+    fn missing_input_is_reported() {
+        let base = tmp("missing-input");
+        let key = key();
+        let regdir = base.join("registry");
+        let job = job(vec![base.join("in").join("nope.png")], Some(base.join("out")), None);
+        let cancel = AtomicBool::new(false);
+        let mut results = vec![];
+        let summary = run_embed(&job, &key, &regdir, &cancel, &mut |ev| {
+            if let EmbedEvent::Item { index, result } = ev {
+                results.push((index, result));
+            }
+        })
+        .unwrap();
+        assert_eq!(summary.ok, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(results.len(), 1);
+        match &results[0].1 {
+            Err(e) => assert!(e.message.starts_with("无法打开 nope.png"), "{}", e.message),
+            Ok(_) => panic!("a missing input must fail"),
+        }
     }
 
     #[test]
