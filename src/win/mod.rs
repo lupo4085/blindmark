@@ -649,11 +649,34 @@ impl App {
             self.cfg.show_start_wizard = result.show_on_start;
             self.cfg.save();
         }
-        self.load_key_and_registry(false);
+        let mut show_registry: Option<Vec<u32>> = None;
+        let mut settings_changed = false;
         match result.outcome {
             start::WizardOutcome::Closed => {}
-            // TODO(W-2/W-3): 接上 SettingsChanged / ShowTab / ShowInRegistry
-            _ => {}
+            start::WizardOutcome::SettingsChanged { key_path, registry_dir } => {
+                self.cfg.key_path = key_path;
+                self.cfg.registry_dir = registry_dir;
+                self.cfg.save();
+                settings_changed = true;
+            }
+            start::WizardOutcome::ShowTab(i) => self.select_tab(i),
+            start::WizardOutcome::ShowInRegistry(ids) => {
+                self.select_tab(TAB_REG);
+                show_registry = Some(ids);
+            }
+        }
+        // W-COMMON: reload after applying the outcome, never before it.
+        self.load_key_and_registry(false);
+        if settings_changed {
+            self.set_status("设置已保存。");
+        }
+        if let Some(ids) = show_registry {
+            if let Some(&id) = ids.first() {
+                regpage::select_id(self, id);
+            }
+            if ids.len() > 1 {
+                self.set_status(&format!("本次共 {} 条，已选中第一条", ids.len()));
+            }
         }
     }
 
