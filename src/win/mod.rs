@@ -11,7 +11,6 @@ mod regpage;
 mod setpage;
 mod start;
 mod util;
-mod wizard;
 
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -47,7 +46,6 @@ pub mod cmd {
     pub const DETECT_FILE: u16 = 103;
     pub const DETECT_CLIP: u16 = 104;
     pub const EXIT: u16 = 105;
-    pub const WIZARD: u16 = 106;
     pub const START: u16 = 107;
     pub const REMOVE: u16 = 110;
     pub const CLEAR: u16 = 111;
@@ -320,8 +318,6 @@ fn build_menu() -> HMENU {
             AppendMenuW(m, MF_SEPARATOR, 0, null());
         };
         let file = CreatePopupMenu();
-        add(file, cmd::WIZARD, "使用向导…\tCtrl+W");
-        sep(file);
         add(file, cmd::ADD_FILES, "添加图片…\tCtrl+O");
         add(file, cmd::ADD_FOLDER, "添加文件夹…");
         sep(file);
@@ -369,7 +365,6 @@ fn build_accelerators() -> HACCEL {
         ACCEL { fVirt: c, key: b'O' as u16, cmd: cmd::ADD_FILES },
         ACCEL { fVirt: c, key: b'D' as u16, cmd: cmd::DETECT_FILE },
         ACCEL { fVirt: c, key: b'V' as u16, cmd: cmd::DETECT_CLIP },
-        ACCEL { fVirt: c, key: b'W' as u16, cmd: cmd::WIZARD },
         ACCEL { fVirt: c | FSHIFT as u8, key: b'C' as u16, cmd: cmd::COPY_REPORT },
         ACCEL { fVirt: v, key: VK_DELETE, cmd: cmd::REMOVE },
         ACCEL { fVirt: v, key: VK_F5, cmd: cmd::REFRESH },
@@ -630,13 +625,6 @@ impl App {
         }
     }
 
-    /// Run the guided wizard, then reload the key and registry it may have changed.
-    pub fn open_wizard(&mut self) {
-        let changed = wizard::open(self.hwnd, &mut self.cfg);
-        self.load_key_and_registry(false);
-        self.set_status(if changed { "向导完成，登记表已更新" } else { "向导已结束" });
-    }
-
     /// Run the new setup wizard (W-1) and apply the small piece of state it returns.
     pub fn open_start(&mut self) {
         let ctx = start::WizardContext {
@@ -715,7 +703,6 @@ impl App {
             cmd::EXIT => unsafe {
                 PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
             },
-            cmd::WIZARD => self.open_wizard(),
             cmd::START => self.open_start(),
             cmd::REMOVE => {
                 if self.cur == TAB_EMBED {
