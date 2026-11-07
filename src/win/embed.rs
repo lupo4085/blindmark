@@ -11,7 +11,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::BN_CLICKED;
 use super::config::Settings;
 use super::util::*;
 use super::{post, App, WorkerMsg};
-use blindmark::registry::Registry;
+use blindmark::jobs::{run_embed, EmbedEvent, EmbedJob, EmbedOk, UserError};
 
 const ADD: u16 = 1101;
 const FOLDER: u16 = 1102;
@@ -414,31 +414,37 @@ fn start(a: &mut App) {
     let hw = a.hwnd as isize;
     let regdir = a.cfg.registry_dir.clone();
     let chan = if channel.is_empty() { None } else { Some(channel) };
+    let rows: Vec<usize> = jobs.iter().map(|(row, _)| *row).collect();
+    let files: Vec<PathBuf> = jobs.iter().map(|(_, path)| path.clone()).collect();
     std::thread::spawn(move || {
-        let mut reg = match Registry::open(&regdir).and_then(|mut r| r.check_key(&key).map(|_| r)) {
-            Ok(r) => r,
-            Err(e) => {
-                for (row, _) in &jobs {
-                    post(&tx, hw, WorkerMsg::EmbedItem { row: *row, res: Err(format!("登记表：{e}")) });
+        let job = EmbedJob {
+            files,
+            out_dir,
+            suffix,
+            strength,
+            jpeg_quality: jpeg.then_some(quality),
+            channel: chan,
+        };
+        let cancelled = match run_embed(&job, &key, &regdir, cancel.as_ref(), &mut |ev| match ev {
+            EmbedEvent::Running { index } => {
+                if let Some(&row) = rows.get(index) {
+                    post(&tx, hw, WorkerMsg::EmbedRunning(row));
                 }
-                post(&tx, hw, WorkerMsg::EmbedDone { cancelled: false });
-                return;
+            }
+            EmbedEvent::Item { index, result } => {
+                if let Some(&row) = rows.get(index) {
+                    post(&tx, hw, WorkerMsg::EmbedItem { row, res: result });
+                }
+            }
+        }) {
+            Ok(summary) => summary.cancelled,
+            Err(e) => {
+                for &row in &rows {
+                    post(&tx, hw, WorkerMsg::EmbedItem { row, res: Err(e.clone()) });
+                }
+                false
             }
         };
-        let mut cancelled = false;
-        for (row, path) in jobs {
-            if cancel.load(Ordering::Relaxed) {
-                cancelled = true;
-                break;
-            }
-            post(&tx, hw, WorkerMsg::EmbedRunning(row));
-            let dir = out_dir.clone().unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
-            let out = blindmark::unique_output_path(&dir, &path, &suffix, jpeg);
-            let res = blindmark::embed_file(&path, &out, &key, &mut reg, strength, chan.clone(), jpeg.then_some(quality))
-                .map(|r| (r.id, r.psnr, out))
-                .map_err(|e| format!("{e:#}"));
-            post(&tx, hw, WorkerMsg::EmbedItem { row, res });
-        }
         post(&tx, hw, WorkerMsg::EmbedDone { cancelled });
     });
 }
@@ -451,10 +457,11 @@ pub fn on_running(a: &mut App, row: usize) {
     lv_select(a.embed.list, row as i32);
 }
 
-pub fn on_item(a: &mut App, row: usize, res: Result<(u32, f64, PathBuf), String>) {
+pub fn on_item(a: &mut App, row: usize, res: Result<EmbedOk, UserError>) {
     a.embed.run_done += 1;
     match res {
-        Ok((id, psnr, out)) => {
+        Ok(ok) => {
+            let EmbedOk { id, psnr, output: out } = ok;
             a.embed.run_ok += 1;
             if let Some(d) = out.parent() {
                 if !a.embed.run_dirs.iter().any(|x| x == d) {
@@ -468,11 +475,12 @@ pub fn on_item(a: &mut App, row: usize, res: Result<(u32, f64, PathBuf), String>
             set_row_status(a, row, format!("✓ 0x{id:08x} · PSNR {psnr:.1} dB → {name}"));
         }
         Err(e) => {
+            eprintln!("{}", e.detail);
             a.embed.run_fail += 1;
             if let Some(it) = a.embed.items.get_mut(row) {
                 it.state = State::Failed;
             }
-            set_row_status(a, row, format!("✗ {e}"));
+            set_row_status(a, row, format!("✗ {}", e.message));
         }
     }
     pb_set(a.embed.progress, a.embed.run_done, a.embed.run_total);

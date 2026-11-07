@@ -27,6 +27,7 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::*;
 use windows_sys::Win32::UI::Shell::{DragAcceptFiles, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
+use blindmark::jobs::{EmbedOk, UserError};
 use blindmark::registry::{Registry, ThumbIndex};
 use blindmark::{keys, Report};
 use config::Settings;
@@ -70,7 +71,7 @@ pub const TAB_SET: usize = 3;
 
 pub enum WorkerMsg {
     EmbedRunning(usize),
-    EmbedItem { row: usize, res: Result<(u32, f64, PathBuf), String> },
+    EmbedItem { row: usize, res: Result<EmbedOk, UserError> },
     EmbedDone { cancelled: bool },
     Detect { token: u64, res: Result<(Report, f64), String> },
 }
