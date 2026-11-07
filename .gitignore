@@ -1,3 +1,7 @@
 /target
 *.key
 build.log
+_fresh.*
+_probe.*
+_ui.*
+/review/
