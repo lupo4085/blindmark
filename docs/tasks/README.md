@@ -10,6 +10,7 @@
 | W-2 | 首次设置 S1–S3（先读 W-COMMON.md） | main（W-1 合并之后） | 进行中 |
 | W-3 | 加水印流程 E1–E4 | t-w-2（叠加） | 进行中 |
 | W-4 | 检查流程 C1–C3，删除旧向导 | t-w-3（叠加） | 进行中 |
+| W-4a | S2 卡死修复、文案定稿 | t-w-4（叠加） | 待做 |
 | A-fix / D-fix | alpha 分支的修复 | alpha（变基到 main 之后） | 卡未写 |
 | FMT | 整个仓库 cargo fmt，并加 rustfmt.toml | main（等 alpha 合并之后） | 卡未写 |
 | W-5 | 分发流程 D1–D5 | main（等 alpha 合并之后） | 卡未写 |
