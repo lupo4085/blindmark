@@ -278,6 +278,8 @@ struct St {
     check_total: usize,
     check_done: usize,
     check_note: Option<UserError>,
+    /// The sheet's own "Next" caption, captured once so commit pages can restore it.
+    next_default: Vec<u16>,
 }
 
 /// Read the state pointer stored in `GWLP_USERDATA` by the page's `WM_INITDIALOG`.
@@ -327,6 +329,7 @@ pub fn run(owner: HWND, ctx: WizardContext) -> WizardResult {
         run: None,
         results: Vec::new(),
         stopped: false,
+        next_default: Vec::new(),
         check_items: Vec::new(),
         check_results: Vec::new(),
         check_rx: None,
@@ -421,6 +424,9 @@ unsafe fn init_state(h: HWND, lp: LPARAM) {
         if state != 0 {
             SetWindowLongPtrW(h, GWLP_USERDATA, state);
         }
+        // Never paint the page background over child controls when they move.
+        let style = GetWindowLongPtrW(h, GWL_STYLE);
+        SetWindowLongPtrW(h, GWL_STYLE, style | WS_CLIPCHILDREN as isize);
     }
 }
 
@@ -460,15 +466,209 @@ fn guard<F: FnOnce() -> isize>(h: HWND, f: F) -> isize {
 // ------------------------------------------------------------------ painting
 
 /// Content area to the right of the painted watermark strip.
-const CONTENT_X: i32 = 196;
+/// Width of the painted strip and start of the content column, at 96 DPI (scaled with `sc`).
+const STRIP_W: i32 = 150;
+const CONTENT_X: i32 = 168;
 
 fn content_x(_w: i32) -> i32 {
-    CONTENT_X
+    sc(CONTENT_X)
 }
 
 fn content_w(h: HWND) -> i32 {
     let (pw, _) = client_size(h);
-    (pw - CONTENT_X - 24).max(180)
+    (pw - content_x(pw) - sc(16)).max(sc(200))
+}
+
+/// Bottom of the painted header (title, up to two subtitle lines and the rule).
+fn header_bottom() -> i32 {
+    sc(88)
+}
+
+/// Column layout for one page: content grows down from the header, footer rows are stacked
+/// up from the bottom edge, so the two never overlap.
+struct Lay {
+    x: i32,
+    w: i32,
+    y: i32,
+    bottom: i32,
+}
+
+impl Lay {
+    fn new(h: HWND) -> Lay {
+        let (cw, ht) = client_size(h);
+        Lay { x: content_x(cw), w: content_w(h), y: header_bottom(), bottom: ht - sc(10) }
+    }
+    /// Reserve `height` at the current top and return its y.
+    fn take(&mut self, height: i32) -> i32 {
+        let y = self.y;
+        self.y += height;
+        y
+    }
+    fn gap(&mut self, g: i32) {
+        self.y += g;
+    }
+    /// Reserve `height` at the bottom and return its y.
+    fn foot(&mut self, height: i32) -> i32 {
+        self.bottom -= height;
+        self.bottom
+    }
+    /// Height left between the content cursor and the footer.
+    fn rest(&self) -> i32 {
+        (self.bottom - self.y).max(sc(48))
+    }
+}
+
+/// Width of a single line of `text` in the normal font.
+fn text_w(h: HWND, text: &str) -> i32 {
+    unsafe {
+        let dc = GetDC(h);
+        let old = SelectObject(dc, super::fonts().normal as _);
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let t = w(text);
+        DrawTextW(dc, t.as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(h, dc);
+        r.right - r.left
+    }
+}
+
+/// Natural width of a push button: its caption plus padding.
+fn btn_w(h: HWND, id: u16) -> i32 {
+    (text_w(h, &get_text(ctl(h, id))) + sc(28)).max(sc(84))
+}
+
+/// Split buttons into rows that fit `maxw`.
+fn button_rows(h: HWND, ids: &[u16], maxw: i32) -> Vec<Vec<(u16, i32)>> {
+    let mut rows: Vec<Vec<(u16, i32)>> = vec![Vec::new()];
+    let mut used = 0;
+    for &id in ids {
+        let bw = btn_w(h, id).min(maxw);
+        let need = if used == 0 { bw } else { used + sc(8) + bw };
+        if need > maxw && used > 0 {
+            rows.push(Vec::new());
+            used = bw;
+        } else {
+            used = need;
+        }
+        rows.last_mut().expect("row").push((id, bw));
+    }
+    rows
+}
+
+const BTN_H: i32 = 26;
+const ROW_GAP: i32 = 6;
+
+/// Place `ids` as one or more footer rows (bottom-up). Returns the top y of the block.
+fn foot_buttons(h: HWND, lay: &mut Lay, ids: &[u16]) -> i32 {
+    let rows = button_rows(h, ids, lay.w);
+    for row in rows.iter().rev() {
+        let y = lay.foot(sc(BTN_H));
+        let mut x = lay.x;
+        for &(id, bw) in row {
+            mv(ctl(h, id), x, y, bw, sc(BTN_H));
+            x += bw + sc(8);
+        }
+        lay.foot(sc(ROW_GAP));
+    }
+    lay.bottom
+}
+
+/// Footer label sized to its current text (hidden or empty labels take no space).
+fn foot_label(h: HWND, lay: &mut Lay, id: u16) {
+    let c = ctl(h, id);
+    let text = get_text(c);
+    if text.is_empty() || unsafe { IsWindowVisible(c) } == 0 {
+        mv(c, lay.x, lay.bottom, lay.w, 0);
+        return;
+    }
+    let lh = measure_text(h, &text, lay.w);
+    let y = lay.foot(lh);
+    mv(c, lay.x, y, lay.w, lh);
+    lay.foot(sc(4));
+}
+
+/// Content label sized to its current text.
+fn take_label(h: HWND, lay: &mut Lay, id: u16, indent: i32) {
+    let c = ctl(h, id);
+    let lw = lay.w - indent;
+    let text = get_text(c);
+    let lh = if text.is_empty() { sc(18) } else { measure_text(h, &text, lw) };
+    let y = lay.take(lh);
+    mv(c, lay.x + indent, y, lw, lh);
+}
+
+/// Spread list-view columns over the control's width by `weights`.
+fn fit_columns(lv: HWND, weights: &[i32]) {
+    let (w, _) = client_size(lv);
+    let avail = (w - sc(4)).max(sc(120));
+    let total: i32 = weights.iter().sum();
+    for (i, wt) in weights.iter().enumerate() {
+        send(lv, LVM_SETCOLUMNWIDTH, i, (avail * wt / total.max(1)) as LPARAM);
+    }
+}
+
+/// Set a message/label text and re-run the page layout, since footer heights follow the text.
+fn set_msg(h: HWND, id: u16, text: &str) {
+    if get_text(ctl(h, id)) == text {
+        return;
+    }
+    set_text(ctl(h, id), text);
+    relayout(h);
+    unsafe {
+        // Repaint the children too: the page erases its background over moved controls.
+        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
+/// Repaint the page and every control on it. Moving overlapping siblings (the empty-list
+/// hint sits on top of the list) can otherwise leave stale pixels behind.
+fn redraw(h: HWND) {
+    unsafe {
+        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
+/// Re-layout after a label's text changed (footer heights depend on text).
+fn relayout(h: HWND) {
+    unsafe {
+        SendMessageW(h, WM_SIZE, 0, 0);
+    }
+}
+
+/// Remember the sheet's own "Next" caption the first time any page becomes active.
+fn capture_next(h: HWND) {
+    if let Some(s) = st(h) {
+        if s.next_default.is_empty() {
+            let b = unsafe { GetDlgItem(sheet(h), 0x3024) };
+            let t = get_text(b);
+            if !t.is_empty() {
+                s.next_default = w(&t);
+            }
+        }
+    }
+}
+
+/// Ask the sheet to show `wanted` on its Next button and return what the button really
+/// shows afterwards ("下一步" when the sheet ignored the request), for the commit note.
+fn commit_label(h: HWND, wanted: &str) -> String {
+    let text = w(wanted);
+    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+    let shown = get_text(unsafe { GetDlgItem(sheet(h), 0x3024) }).replace('&', "");
+    if shown.contains(wanted) { wanted.to_string() } else { "下一步".to_string() }
+}
+
+/// Put the sheet's original "Next" caption back (used when leaving a commit page).
+fn restore_next(h: HWND) {
+    let text = st(h).map(|s| s.next_default.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| w("下一步(&N) >"));
+    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+}
+
+/// Add `SS_PATHELLIPSIS` so long paths in a label are shortened in the middle.
+fn path_style(c: HWND) {
+    unsafe {
+        let st = GetWindowLongPtrW(c, GWL_STYLE);
+        SetWindowLongPtrW(c, GWL_STYLE, st | 0x8000);
+    }
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -512,17 +712,17 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
         if !title.is_empty() {
             let f = super::fonts();
             let x = content_x(cw);
-            let text_w = (cw - x - 12).max(120);
+            let text_w = (cw - x - sc(12)).max(sc(120));
             SetBkMode(hdc, TRANSPARENT as i32);
             SelectObject(hdc, f.big as _);
             SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
             let t = w(title);
-            let mut r = RECT { left: x, top: 8, right: x + text_w, bottom: 40 };
+            let mut r = RECT { left: x, top: sc(10), right: x + text_w, bottom: sc(40) };
             DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SelectObject(hdc, f.normal as _);
             let t = w(subtitle);
-            let mut r = RECT { left: x, top: 38, right: x + text_w, bottom: 66 };
-            DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            let mut r = RECT { left: x, top: sc(42), right: x + text_w, bottom: sc(80) };
+            DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS | DT_EDITCONTROL);
         }
         return;
     }
@@ -531,10 +731,10 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
 
     let bmp = st(h).map(|s| s.bmp).unwrap_or(null_mut());
     if !bmp.is_null() {
-        let strip = content_x(cw) - 8;
+        let strip = sc(STRIP_W);
         let mem = CreateCompatibleDC(hdc);
         let old = SelectObject(mem, bmp as _);
-        StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 164, 314, SRCCOPY);
+        StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 150, 380, SRCCOPY);
         SelectObject(mem, old);
         DeleteDC(mem);
     }
@@ -545,16 +745,16 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
         SetBkMode(hdc, TRANSPARENT as i32);
         SelectObject(hdc, f.big as _);
         SetTextColor(hdc, rgb(28, 32, 36));
-        let text_w = (cw - x - 12).max(120);
+        let text_w = (cw - x - sc(12)).max(sc(120));
         let t = w(title);
-        let mut r = RECT { left: x, top: 8, right: x + text_w, bottom: 40 };
+        let mut r = RECT { left: x, top: sc(10), right: x + text_w, bottom: sc(40) };
         DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(hdc, f.normal as _);
         SetTextColor(hdc, rgb(96, 104, 112));
         let t = w(subtitle);
-        let mut r = RECT { left: x, top: 38, right: x + text_w, bottom: 66 };
-        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-        let line = RECT { left: x, top: 68, right: cw - 12, bottom: 69 };
+        let mut r = RECT { left: x, top: sc(42), right: x + text_w, bottom: sc(80) };
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS | DT_EDITCONTROL);
+        let line = RECT { left: x, top: sc(82), right: cw - sc(12), bottom: sc(82) + 1 };
         fill(hdc, &line, rgb(226, 230, 234));
     }
 }
@@ -643,7 +843,11 @@ fn step_y(s: &St) -> i32 {
 }
 
 fn step_text(x: i32, y: i32, base: &str) -> String {
-    format!("第 {x} 步，共 {y} 步 · {base}")
+    if base.is_empty() {
+        format!("第 {x} 步，共 {y} 步")
+    } else {
+        format!("第 {x} 步，共 {y} 步 · {base}")
+    }
 }
 
 /// A small TaskDialog with custom buttons. Returns the pressed button ID (0 = closed).
@@ -747,15 +951,13 @@ fn build_welcome(h: HWND) {
 }
 
 fn layout_welcome(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let check_h = sc(22);
-    let check_y = ht - sc(14) - check_h;
-    mv(ctl(h, ID_SHOW_ON_START), x, check_y, cw, check_h);
-    let body_y = 76;
-    let body_h = (check_y - sc(6) - body_y).max(sc(60));
-    mv(ctl(h, ID_WELCOME_BODY), x, body_y, cw, body_h);
+    let mut lay = Lay::new(h);
+    let y = lay.foot(sc(24));
+    mv(ctl(h, ID_SHOW_ON_START), lay.x, y, lay.w, sc(24));
+    lay.foot(sc(6));
+    lay.gap(sc(4));
+    let body_h = lay.rest();
+    mv(ctl(h, ID_WELCOME_BODY), lay.x, lay.y, lay.w, body_h);
 }
 
 unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -769,11 +971,13 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
             build_welcome(h);
             set_font_tree(h, super::fonts().normal);
             layout_welcome(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_welcome(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -794,6 +998,7 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_WELCOME;
                     }
@@ -813,6 +1018,7 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_welcome(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -832,19 +1038,16 @@ fn build_task(h: HWND) {
 }
 
 fn layout_task(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
+    let mut lay = Lay::new(h);
     let key_present = st(h).map(|s| s.ctx.key.is_some()).unwrap_or(false);
-    let desc_w = cw.max(sc(80));
-    let heights: Vec<i32> = (0..4).map(|i| measure_text(h, task_desc(i, key_present), desc_w)).collect();
-    let total: i32 = 4 * sc(22) + 4 * sc(6) + heights.iter().sum::<i32>();
-    let bottom = ht - sc(16);
-    let mut y = if 78 + total <= bottom { 78 } else { (bottom - total).max(74) };
+    lay.gap(sc(4));
     for i in 0..4 {
-        mv(ctl(h, ID_TASK_RADIO[i]), x, y, cw, sc(22));
-        mv(ctl(h, ID_TASK_DESC[i]), x, y + sc(20), desc_w, heights[i]);
-        y += sc(22) + heights[i] + sc(6);
+        let y = lay.take(sc(22));
+        mv(ctl(h, ID_TASK_RADIO[i]), lay.x, y, lay.w, sc(22));
+        let dh = measure_text(h, task_desc(i, key_present), lay.w - sc(20));
+        let y = lay.take(dh);
+        mv(ctl(h, ID_TASK_DESC[i]), lay.x + sc(20), y, lay.w - sc(20), dh);
+        lay.gap(sc(10));
     }
 }
 
@@ -862,11 +1065,13 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                 set_font(ctl(h, id), super::fonts().bold);
             }
             layout_task(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_task(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -879,6 +1084,7 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_TASK;
                         if !ID_TASK_RADIO.iter().any(|&id| checked(ctl(h, id))) {
@@ -919,6 +1125,7 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_task(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -937,6 +1144,8 @@ fn build_s1(h: HWND) {
     label_id(h, ID_S1_FINGERPRINT, "");
     label_id(h, ID_S1_HINT, S1_HINT);
     label_id(h, ID_S1_ERROR, "");
+    path_style(ctl(h, ID_S1_PATH));
+    path_style(ctl(h, ID_S1_EXISTING_PATH));
     refresh_s1(h);
 }
 
@@ -947,45 +1156,49 @@ fn refresh_s1(h: HWND) {
         KeyChoice::Existing(p) => p.clone(),
         KeyChoice::New(_) => None,
     };
-    set_check(ctl(h, ID_S1_NEW), existing.is_none());
-    set_check(ctl(h, ID_S1_EXISTING), existing.is_some());
+    let is_existing = matches!(s.key_choice, KeyChoice::Existing(_));
+    set_check(ctl(h, ID_S1_NEW), !is_existing);
+    set_check(ctl(h, ID_S1_EXISTING), is_existing);
+    enable(ctl(h, ID_S1_CHANGE), !is_existing);
+    enable(ctl(h, ID_S1_PATH), !is_existing);
+    enable(ctl(h, ID_S1_BROWSE), is_existing);
     set_text(ctl(h, ID_S1_PATH), &format!("保存位置：{}", new_path.display()));
     match &existing {
         Some(p) => {
-            set_text(ctl(h, ID_S1_EXISTING_PATH), &p.display().to_string());
+            set_msg(h, ID_S1_EXISTING_PATH, &p.display().to_string());
             match jobs::read_key_file(p) {
-                Ok(k) => set_text(ctl(h, ID_S1_FINGERPRINT), &format!("密钥指纹：{}（用来核对是不是同一把密钥）", keys::fingerprint(&k))),
-                Err(_) => set_text(ctl(h, ID_S1_FINGERPRINT), ""),
+                Ok(k) => set_msg(h, ID_S1_FINGERPRINT, &format!("密钥指纹：{}（用来核对是不是同一把密钥）", keys::fingerprint(&k))),
+                Err(_) => set_msg(h, ID_S1_FINGERPRINT, ""),
             }
         }
         None => {
-            set_text(ctl(h, ID_S1_EXISTING_PATH), "");
-            set_text(ctl(h, ID_S1_FINGERPRINT), "");
+            set_msg(h, ID_S1_EXISTING_PATH, "");
+            set_msg(h, ID_S1_FINGERPRINT, "");
         }
     }
 }
 
 fn layout_s1(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let mut y = 72;
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    let ind = sc(20);
+    lay.gap(sc(2));
+    let y = lay.take(sc(24));
     mv(ctl(h, ID_S1_NEW), x, y, cw, sc(22));
-    y += sc(24);
-    mv(ctl(h, ID_S1_PATH), x + sc(20), y, cw - sc(120), sc(20));
-    mv(ctl(h, ID_S1_CHANGE), x + cw - sc(100), y - sc(2), sc(100), sc(26));
-    y += sc(30);
+    let cbw = btn_w(h, ID_S1_CHANGE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S1_PATH), x + ind, y + sc(4), cw - ind - cbw - sc(8), sc(20));
+    mv(ctl(h, ID_S1_CHANGE), x + cw - cbw, y, cbw, sc(BTN_H));
+    lay.gap(sc(10));
+    let y = lay.take(sc(24));
     mv(ctl(h, ID_S1_EXISTING), x, y, cw, sc(22));
-    y += sc(24);
-    mv(ctl(h, ID_S1_BROWSE), x + sc(20), y, sc(90), sc(26));
-    y += sc(30);
-    mv(ctl(h, ID_S1_EXISTING_PATH), x + sc(20), y, cw - sc(20), sc(20));
-    y += sc(22);
-    mv(ctl(h, ID_S1_FINGERPRINT), x + sc(20), y, cw - sc(20), sc(20));
-    let err_y = ht - sc(16) - sc(20);
-    mv(ctl(h, ID_S1_ERROR), x, err_y, cw, sc(20));
-    let hint_y = (err_y - sc(6) - sc(34)).max(y + sc(22));
-    mv(ctl(h, ID_S1_HINT), x, hint_y, cw, sc(34));
+    let bbw = btn_w(h, ID_S1_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S1_BROWSE), x + ind, y, bbw, sc(BTN_H));
+    mv(ctl(h, ID_S1_EXISTING_PATH), x + ind + bbw + sc(8), y + sc(4), cw - ind - bbw - sc(8), sc(20));
+    take_label(h, &mut lay, ID_S1_FINGERPRINT, ind);
+    foot_label(h, &mut lay, ID_S1_ERROR);
+    foot_label(h, &mut lay, ID_S1_HINT);
 }
 
 unsafe extern "system" fn page_s1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -999,11 +1212,13 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_s1(h);
             set_font_tree(h, super::fonts().normal);
             layout_s1(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_s1(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1024,7 +1239,7 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                         let p = s.new_path.clone();
                         s.key_choice = KeyChoice::New(p);
                     }
-                    set_text(ctl(h, ID_S1_ERROR), "");
+                    set_msg(h, ID_S1_ERROR, "");
                     refresh_s1(h);
                     1
                 }
@@ -1045,7 +1260,7 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                             s.new_path = p.clone();
                             s.key_choice = KeyChoice::New(p);
                         }
-                        set_text(ctl(h, ID_S1_ERROR), "");
+                        set_msg(h, ID_S1_ERROR, "");
                         refresh_s1(h);
                     }
                     1
@@ -1056,8 +1271,8 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                             s.key_choice = KeyChoice::Existing(Some(p.clone()));
                         }
                         match jobs::read_key_file(&p) {
-                            Ok(_) => set_text(ctl(h, ID_S1_ERROR), ""),
-                            Err(e) => set_text(ctl(h, ID_S1_ERROR), &e.message),
+                            Ok(_) => set_msg(h, ID_S1_ERROR, ""),
+                            Err(e) => set_msg(h, ID_S1_ERROR, &e.message),
                         }
                         refresh_s1(h);
                     }
@@ -1070,6 +1285,7 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_SETUP_KEY;
                     }
@@ -1097,7 +1313,7 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                                         return block_page(h);
                                     }
                                     Err(e) => {
-                                        set_text(ctl(h, ID_S1_ERROR), &e.message);
+                                        set_msg(h, ID_S1_ERROR, &e.message);
                                         return block_page(h);
                                     }
                                 }
@@ -1107,12 +1323,12 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                         KeyChoice::Existing(Some(path)) => match jobs::read_key_file(&path) {
                             Ok(_) => advance_to(h, PAGE_SETUP_REGISTRY),
                             Err(e) => {
-                                set_text(ctl(h, ID_S1_ERROR), &e.message);
+                                set_msg(h, ID_S1_ERROR, &e.message);
                                 block_page(h)
                             }
                         },
                         KeyChoice::Existing(None) => {
-                            set_text(ctl(h, ID_S1_ERROR), "请先新建一把密钥，或选择已有的密钥文件。");
+                            set_msg(h, ID_S1_ERROR, "请先新建一把密钥，或选择已有的密钥文件。");
                             block_page(h)
                         }
                     }
@@ -1123,6 +1339,7 @@ unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_s1(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -1147,7 +1364,7 @@ fn refresh_s2(h: HWND) {
     let Some(s) = st(h) else { return };
     let dir = PathBuf::from(get_text(ctl(h, ID_S2_DIR)).trim());
     if dir.as_os_str().is_empty() {
-        set_text(ctl(h, ID_S2_STATUS), "");
+        set_msg(h, ID_S2_STATUS, "");
         return;
     }
     let key = match &s.key_choice {
@@ -1155,38 +1372,38 @@ fn refresh_s2(h: HWND) {
         _ => None,
     };
     match jobs::inspect_registry(&dir, key.as_deref()) {
-        Ok(RegistryStatus::New) => set_text(ctl(h, ID_S2_STATUS), "这是一个新的登记表。"),
+        Ok(RegistryStatus::New) => set_msg(h, ID_S2_STATUS, "这是一个新的登记表。"),
         Ok(RegistryStatus::Matches { entries }) => {
             let text = if key.is_some() { format!("已有登记表，共 {entries} 条记录，与所选密钥匹配。") } else { format!("已有登记表，共 {entries} 条记录。") };
-            set_text(ctl(h, ID_S2_STATUS), &text);
+            set_msg(h, ID_S2_STATUS, &text);
         }
-        Ok(RegistryStatus::Mismatch { fingerprint }) => set_text(
-            ctl(h, ID_S2_STATUS),
-            &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
+        Ok(RegistryStatus::Mismatch { fingerprint }) => set_msg(h, ID_S2_STATUS, &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
         ),
-        Err(e) => set_text(ctl(h, ID_S2_STATUS), &e.message),
+        Err(e) => set_msg(h, ID_S2_STATUS, &e.message),
     }
 }
 
 fn set_submit_text(h: HWND) {
     let button = if st(h).map(|s| s.task == Task::Setup).unwrap_or(true) { "保存设置" } else { "保存并继续" };
-    let text = w(button);
-    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
-    set_text(ctl(h, ID_S2_NOTE), &format!("点击“{button}”后会保存设置。"));
+    let label = commit_label(h, button);
+    set_msg(h, ID_S2_NOTE, &format!("点击“{label}”后会保存设置。"));
 }
 
 fn layout_s2(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_S2_BODY), x, 74, cw, sc(20));
-    mv(ctl(h, ID_S2_LABEL), x, 104, sc(40), sc(20));
-    mv(ctl(h, ID_S2_DIR), x + sc(44), 100, cw - sc(140), sc(24));
-    mv(ctl(h, ID_S2_BROWSE), x + cw - sc(90), 99, sc(90), sc(26));
-    mv(ctl(h, ID_S2_STATUS), x, 132, cw, sc(20));
-    let err_y = ht - sc(16) - sc(20);
-    mv(ctl(h, ID_S2_ERROR), x, err_y, cw, sc(20));
-    mv(ctl(h, ID_S2_NOTE), x, err_y - sc(6) - sc(20), cw, sc(20));
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    take_label(h, &mut lay, ID_S2_BODY, 0);
+    lay.gap(sc(10));
+    let lw = text_w(h, "位置") + sc(10);
+    let bw = btn_w(h, ID_S2_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S2_LABEL), x, y + sc(4), lw, sc(20));
+    mv(ctl(h, ID_S2_DIR), x + lw, y + sc(1), cw - lw - bw - sc(8), sc(24));
+    mv(ctl(h, ID_S2_BROWSE), x + cw - bw, y, bw, sc(BTN_H));
+    lay.gap(sc(4));
+    take_label(h, &mut lay, ID_S2_STATUS, 0);
+    foot_label(h, &mut lay, ID_S2_ERROR);
+    foot_label(h, &mut lay, ID_S2_NOTE);
 }
 
 unsafe extern "system" fn page_s2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -1200,11 +1417,13 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_s2(h);
             set_font_tree(h, super::fonts().normal);
             layout_s2(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_s2(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1235,6 +1454,7 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_SETUP_REGISTRY;
                     }
@@ -1244,14 +1464,13 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     0
                 }
                 PSN_KILLACTIVE => {
-                    let text = w("下一步(&N) >");
-                    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+                    restore_next(h);
                     0
                 }
                 PSN_WIZNEXT => {
                     let dir = PathBuf::from(get_text(ctl(h, ID_S2_DIR)).trim());
                     if dir.as_os_str().is_empty() {
-                        set_text(ctl(h, ID_S2_ERROR), "请选择登记表的保存位置。");
+                        set_msg(h, ID_S2_ERROR, "请选择登记表的保存位置。");
                         return block_page(h);
                     }
                     let choice = st(h).map(|s| s.key_choice.clone()).unwrap_or(KeyChoice::Existing(None));
@@ -1266,38 +1485,37 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                                 (k, path)
                             }
                             Err(e) => {
-                                set_text(ctl(h, ID_S2_ERROR), &e.message);
+                                set_msg(h, ID_S2_ERROR, &e.message);
                                 return block_page(h);
                             }
                         },
                         KeyChoice::Existing(Some(path)) => match jobs::read_key_file(&path) {
                             Ok(k) => (k, path),
                             Err(e) => {
-                                set_text(ctl(h, ID_S2_ERROR), &e.message);
+                                set_msg(h, ID_S2_ERROR, &e.message);
                                 return block_page(h);
                             }
                         },
                         KeyChoice::Existing(None) => {
-                            set_text(ctl(h, ID_S2_ERROR), "请先新建一把密钥，或选择已有的密钥文件。");
+                            set_msg(h, ID_S2_ERROR, "请先新建一把密钥，或选择已有的密钥文件。");
                             return block_page(h);
                         }
                     };
                     match jobs::inspect_registry(&dir, Some(&key)) {
                         Ok(RegistryStatus::Mismatch { fingerprint }) => {
-                            set_text(
-                                ctl(h, ID_S2_ERROR),
-                                &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
+                            set_msg(h, ID_S2_ERROR, "");
+                            set_msg(h, ID_S2_STATUS, &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
                             );
                             return block_page(h);
                         }
                         Ok(_) => {}
                         Err(e) => {
-                            set_text(ctl(h, ID_S2_ERROR), &e.message);
+                            set_msg(h, ID_S2_ERROR, &e.message);
                             return block_page(h);
                         }
                     }
                     if let Err(e) = jobs::open_registry_for_write(&dir, &key) {
-                        set_text(ctl(h, ID_S2_ERROR), &e.message);
+                        set_msg(h, ID_S2_ERROR, &e.message);
                         return block_page(h);
                     }
                     let target = match st(h).map(|s| s.task).unwrap_or(Task::Setup) {
@@ -1326,6 +1544,7 @@ unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_s2(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -1342,13 +1561,21 @@ fn build_s3(h: HWND) {
 }
 
 fn layout_s3(h: HWND) {
-    let (w, _ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_S3_BODY), x, 84, cw, sc(44));
-    mv(ctl(h, ID_S3_BACKUP_KEY), x, 140, sc(150), sc(30));
-    mv(ctl(h, ID_S3_BACKUP_REG), x + sc(160), 140, sc(160), sc(30));
-    mv(ctl(h, ID_S3_HINT), x, 184, cw, sc(20));
+    let mut lay = Lay::new(h);
+    take_label(h, &mut lay, ID_S3_BODY, 0);
+    lay.gap(sc(12));
+    let rows = button_rows(h, &[ID_S3_BACKUP_KEY, ID_S3_BACKUP_REG], lay.w);
+    for row in rows {
+        let y = lay.take(sc(BTN_H));
+        let mut x = lay.x;
+        for (id, bw) in row {
+            mv(ctl(h, id), x, y, bw, sc(BTN_H));
+            x += bw + sc(8);
+        }
+        lay.gap(sc(ROW_GAP));
+    }
+    lay.gap(sc(8));
+    take_label(h, &mut lay, ID_S3_HINT, 0);
 }
 
 unsafe extern "system" fn page_s3(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -1362,11 +1589,13 @@ unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_s3(h);
             set_font_tree(h, super::fonts().normal);
             layout_s3(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_s3(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1414,6 +1643,7 @@ unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_SETUP_DONE;
                     }
@@ -1428,6 +1658,7 @@ unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_s3(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -1498,17 +1729,14 @@ fn refresh_e1(h: HWND) {
 }
 
 fn layout_e1(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let by = ht - sc(40);
-    mv(ctl(h, ID_E1_LIST), x, 78, cw, (by - sc(10) - 78).max(sc(80)));
-    let bw = sc(100);
-    mv(ctl(h, ID_E1_ADD), x, by, bw, sc(28));
-    mv(ctl(h, ID_E1_FOLDER), x + bw + sc(8), by, bw + sc(20), sc(28));
-    mv(ctl(h, ID_E1_REMOVE), x + 2 * (bw + sc(8)) + sc(20), by, sc(80), sc(28));
-    mv(ctl(h, ID_E1_EMPTY), x + sc(20), 130, cw - sc(40), sc(40));
-    mv(ctl(h, ID_E1_ERROR), x, ht - sc(16) - sc(20), cw, sc(20));
+    let mut lay = Lay::new(h);
+    foot_label(h, &mut lay, ID_E1_ERROR);
+    foot_buttons(h, &mut lay, &[ID_E1_ADD, ID_E1_FOLDER, ID_E1_REMOVE]);
+    let lh = lay.rest() - sc(4);
+    let lv = ctl(h, ID_E1_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lh);
+    fit_columns(lv, &[45, 20, 35]);
+    mv(ctl(h, ID_E1_EMPTY), lay.x + sc(16), lay.y + lh / 2 - sc(10), lay.w - sc(32), sc(20));
 }
 
 unsafe extern "system" fn page_e1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -1522,11 +1750,13 @@ unsafe fn page_e1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_e1(h);
             set_font_tree(h, super::fonts().normal);
             layout_e1(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_e1(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1587,6 +1817,7 @@ unsafe fn page_e1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_EMBED_FILES;
                     }
@@ -1596,7 +1827,7 @@ unsafe fn page_e1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                 }
                 PSN_WIZNEXT => {
                     if st(h).map(|s| s.files.is_empty()).unwrap_or(true) {
-                        set_text(ctl(h, ID_E1_ERROR), "请至少添加一张图片。");
+                        set_msg(h, ID_E1_ERROR, "请至少添加一张图片。");
                         return block_page(h);
                     }
                     advance_to(h, PAGE_EMBED_OPTIONS)
@@ -1608,6 +1839,7 @@ unsafe fn page_e1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_e1(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -1633,9 +1865,8 @@ fn refresh_e2_enabled(h: HWND) {
 }
 
 fn set_submit_text_e2(h: HWND) {
-    let text = w("开始加水印");
-    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
-    set_text(ctl(h, ID_E2_NOTE_LAST), "点击“开始加水印”后开始加水印，已完成的部分无法通过“上一步”撤销。");
+    let label = commit_label(h, "开始加水印");
+    set_msg(h, ID_E2_NOTE_LAST, &format!("点击“{label}”后开始加水印，已完成的部分无法通过“上一步”撤销。"));
 }
 
 fn build_e2(h: HWND) {
@@ -1650,7 +1881,7 @@ fn build_e2(h: HWND) {
     label_id(h, 2021, "格式");
     radio(h, ID_E2_PNG, "PNG（推荐，画质无损）", true);
     radio(h, ID_E2_JPG, &format!("JPEG（质量 {}）", s.ctx.cfg.jpeg_quality), false);
-    button(h, ID_E2_ADV, "高级 ▸");
+    button(h, ID_E2_ADV, "显示高级选项");
     trackbar(h, ID_E2_STRENGTH, 15, 40);
     tb_set(ctl(h, ID_E2_STRENGTH), (s.strength * 10.0).round() as i32);
     label_id(h, ID_E2_STRENGTH_LABEL, "");
@@ -1668,24 +1899,37 @@ fn build_e2(h: HWND) {
 }
 
 fn layout_e2(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, 2020), x, 70, cw, sc(20));
-    mv(ctl(h, ID_E2_NOTE), x, 90, cw, sc(24));
-    mv(ctl(h, ID_E2_SAME), x, 122, cw, sc(22));
-    mv(ctl(h, ID_E2_SPECIFIED), x, 146, sc(110), sc(22));
-    mv(ctl(h, ID_E2_OUTDIR), x + sc(114), 144, cw - sc(210), sc(24));
-    mv(ctl(h, ID_E2_BROWSE), x + cw - sc(90), 143, sc(90), sc(26));
-    mv(ctl(h, 2021), x, 178, cw, sc(20));
-    mv(ctl(h, ID_E2_PNG), x, 198, cw, sc(22));
-    mv(ctl(h, ID_E2_JPG), x, 220, cw, sc(22));
-    mv(ctl(h, ID_E2_ADV), x, 250, sc(90), sc(26));
-    mv(ctl(h, ID_E2_STRENGTH), x + sc(100), 250, cw - sc(180), sc(26));
-    mv(ctl(h, ID_E2_STRENGTH_LABEL), x + cw - sc(76), 256, sc(76), sc(20));
-    let err_y = ht - sc(16) - sc(20);
-    mv(ctl(h, ID_E2_ERROR), x, err_y, cw, sc(20));
-    mv(ctl(h, ID_E2_NOTE_LAST), x, err_y - sc(6) - sc(20), cw, sc(20));
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    let y = lay.take(sc(20));
+    mv(ctl(h, 2020), x, y, cw, sc(20));
+    let y = lay.take(sc(28));
+    mv(ctl(h, ID_E2_NOTE), x, y, cw, sc(24));
+    lay.gap(sc(6));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_SAME), x, y, cw, sc(22));
+    let rw = text_w(h, &get_text(ctl(h, ID_E2_SPECIFIED))) + sc(28);
+    let bw = btn_w(h, ID_E2_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_E2_SPECIFIED), x, y + sc(2), rw, sc(22));
+    mv(ctl(h, ID_E2_OUTDIR), x + rw, y + sc(1), cw - rw - bw - sc(8), sc(24));
+    mv(ctl(h, ID_E2_BROWSE), x + cw - bw, y, bw, sc(BTN_H));
+    lay.gap(sc(6));
+    let y = lay.take(sc(20));
+    mv(ctl(h, 2021), x, y, cw, sc(20));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_PNG), x, y, cw, sc(22));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_JPG), x, y, cw, sc(22));
+    lay.gap(sc(6));
+    let aw = btn_w(h, ID_E2_ADV);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_E2_ADV), x, y, aw, sc(BTN_H));
+    let lw = sc(96);
+    mv(ctl(h, ID_E2_STRENGTH), x + aw + sc(8), y, cw - aw - lw - sc(16), sc(BTN_H));
+    mv(ctl(h, ID_E2_STRENGTH_LABEL), x + cw - lw, y + sc(4), lw, sc(20));
+    foot_label(h, &mut lay, ID_E2_ERROR);
+    foot_label(h, &mut lay, ID_E2_NOTE_LAST);
 }
 
 unsafe extern "system" fn page_e2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -1699,11 +1943,13 @@ unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_e2(h);
             set_font_tree(h, super::fonts().normal);
             layout_e2(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_e2(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1740,7 +1986,9 @@ unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     let vis = IsWindowVisible(ctl(h, ID_E2_STRENGTH)) != 0;
                     show(ctl(h, ID_E2_STRENGTH), !vis);
                     show(ctl(h, ID_E2_STRENGTH_LABEL), !vis);
-                    set_text(ctl(h, ID_E2_ADV), if vis { "高级 ▸" } else { "高级 ▾" });
+                    set_text(ctl(h, ID_E2_ADV), if vis { "显示高级选项" } else { "隐藏高级选项" });
+                    relayout(h);
+                    redraw(h);
                     1
                 }
                 _ => 0,
@@ -1750,6 +1998,7 @@ unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_EMBED_OPTIONS;
                     }
@@ -1758,15 +2007,14 @@ unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     0
                 }
                 PSN_KILLACTIVE => {
-                    let text = w("下一步(&N) >");
-                    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+                    restore_next(h);
                     0
                 }
                 PSN_WIZNEXT => {
                     let out_same = checked(ctl(h, ID_E2_SAME));
                     let out_dir = get_text(ctl(h, ID_E2_OUTDIR)).trim().to_string();
                     if !out_same && out_dir.is_empty() {
-                        set_text(ctl(h, ID_E2_ERROR), "请选择输出文件夹。");
+                        set_msg(h, ID_E2_ERROR, "请选择输出文件夹。");
                         return block_page(h);
                     }
                     if let Some(s) = st(h) {
@@ -1785,6 +2033,7 @@ unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_e2(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -1821,7 +2070,7 @@ fn start_embed(h: HWND) {
     });
     s.run = Some(RunState { rx, cancel, total, done: 0 });
     pb_set(ctl(h, ID_E3_PROGRESS), 0, total);
-    set_text(ctl(h, ID_E3_STATUS), &format!("正在处理 0 / {total}…"));
+    set_msg(h, ID_E3_STATUS, &format!("正在处理 0 / {total}…"));
     unsafe { SetTimer(h, 2, 100, None) };
 }
 
@@ -1846,11 +2095,13 @@ fn build_e3(h: HWND) {
 }
 
 fn layout_e3(h: HWND) {
-    let (w, _ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_E3_PROGRESS), x, 96, cw, sc(18));
-    mv(ctl(h, ID_E3_STATUS), x, 124, cw, sc(20));
+    let mut lay = Lay::new(h);
+    lay.gap(sc(24));
+    let y = lay.take(sc(20));
+    mv(ctl(h, ID_E3_STATUS), lay.x, y, lay.w, sc(20));
+    lay.gap(sc(6));
+    let y = lay.take(sc(18));
+    mv(ctl(h, ID_E3_PROGRESS), lay.x, y, lay.w, sc(18));
 }
 
 unsafe extern "system" fn page_e3(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -1864,11 +2115,13 @@ unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_e3(h);
             set_font_tree(h, super::fonts().normal);
             layout_e3(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_e3(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -1883,6 +2136,7 @@ unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_EMBED_PROGRESS;
                         s.history.clear();
@@ -1926,7 +2180,7 @@ unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                             let name = s.files.get(index).map(|p| name_of(p)).unwrap_or_default();
                             let done = s.results.len();
                             let total = s.run.as_ref().map(|r| r.total).unwrap_or(0);
-                            set_text(ctl(h, ID_E3_STATUS), &format!("正在处理 {name}（{done}/{total}）…"));
+                            set_msg(h, ID_E3_STATUS, &format!("正在处理 {name}（{done}/{total}）…"));
                         }
                     }
                     EmbedMsg::Event(EmbedEvent::Item { index, result }) => {
@@ -1954,6 +2208,7 @@ unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_e3(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -2000,17 +2255,20 @@ fn build_e4(h: HWND) {
 }
 
 fn layout_e4(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_E4_LIST), x, 78, cw, (ht - 78 - sc(96)).max(sc(80)));
-    let by = ht - sc(16) - sc(30);
-    mv(ctl(h, ID_E4_OPEN), x, by, sc(130), sc(28));
-    mv(ctl(h, ID_E4_REG), x + sc(138), by, sc(140), sc(28));
-    mv(ctl(h, ID_E4_TAB), x + sc(286), by, sc(190), sc(28));
-    mv(ctl(h, ID_E4_NEWKEY), x, by - sc(28), cw - sc(120), sc(20));
-    mv(ctl(h, ID_E4_BACKUP), x + cw - sc(110), by - sc(32), sc(110), sc(26));
-    mv(ctl(h, ID_E4_HINT), x, by - sc(52), cw, sc(20));
+    let mut lay = Lay::new(h);
+    foot_buttons(h, &mut lay, &[ID_E4_OPEN, ID_E4_REG, ID_E4_TAB]);
+    foot_label(h, &mut lay, ID_E4_HINT);
+    let nk = ctl(h, ID_E4_NEWKEY);
+    if unsafe { IsWindowVisible(nk) } != 0 {
+        let bw = btn_w(h, ID_E4_BACKUP);
+        let y = lay.foot(sc(BTN_H));
+        mv(nk, lay.x, y + sc(4), lay.w - bw - sc(8), sc(20));
+        mv(ctl(h, ID_E4_BACKUP), lay.x + lay.w - bw, y, bw, sc(BTN_H));
+        lay.foot(sc(ROW_GAP));
+    }
+    let lv = ctl(h, ID_E4_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lay.rest() - sc(4));
+    fit_columns(lv, &[30, 70]);
 }
 
 unsafe extern "system" fn page_e4(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -2024,11 +2282,13 @@ unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_e4(h);
             set_font_tree(h, super::fonts().normal);
             layout_e4(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_e4(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -2036,7 +2296,8 @@ unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let mut stopped = false;
             let mut total = 0usize;
             if let Some(s) = st(h) {
-                total = s.results.len();
+                // Every queued image counts, including the ones skipped by "停止".
+                total = s.files.len().max(s.results.len());
                 stopped = s.stopped;
                 for (_, r) in &s.results {
                     if r.is_ok() { ok += 1; } else { failed += 1; }
@@ -2101,6 +2362,7 @@ unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_EMBED_DONE;
                     }
@@ -2116,6 +2378,7 @@ unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_e4(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -2160,17 +2423,17 @@ fn c1_paste(h: HWND) {
                 let n = s.check_items.iter().filter(|i| matches!(i, CheckItem::Clip { .. })).count() + 1;
                 s.check_items.push(CheckItem::Clip { label: format!("剪贴板截图 {n}"), img });
             }
-            set_text(ctl(h, ID_C1_ERROR), "");
+            set_msg(h, ID_C1_ERROR, "");
             refresh_c1(h);
         }
         Some(ClipImage::File(p)) => {
             if let Some(s) = st(h) {
                 add_check_files(s, vec![p]);
             }
-            set_text(ctl(h, ID_C1_ERROR), "");
+            set_msg(h, ID_C1_ERROR, "");
             refresh_c1(h);
         }
-        None => set_text(ctl(h, ID_C1_ERROR), "剪贴板里没有图片。"),
+        None => set_msg(h, ID_C1_ERROR, "剪贴板里没有图片。"),
     }
 }
 
@@ -2201,26 +2464,22 @@ fn refresh_c1(h: HWND) {
 }
 
 fn set_submit_text_c1(h: HWND) {
-    let text = w("开始检查");
-    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
-    set_text(ctl(h, ID_C1_NOTE), "点击“开始检查”后开始检查。");
+    let label = commit_label(h, "开始检查");
+    set_msg(h, ID_C1_NOTE, &format!("点击“{label}”后开始检查。"));
 }
 
 fn layout_c1(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let by = ht - sc(72);
-    mv(ctl(h, ID_C1_LIST), x, 78, cw, (by - sc(10) - 78).max(sc(80)));
-    let bw = sc(86);
-    mv(ctl(h, ID_C1_ADD), x, by, bw, sc(26));
-    mv(ctl(h, ID_C1_FOLDER), x + bw + sc(6), by, bw + sc(14), sc(26));
-    mv(ctl(h, ID_C1_REMOVE), x + 2 * (bw + sc(6)) + sc(14), by, sc(64), sc(26));
-    mv(ctl(h, ID_C1_PASTE), x, by + sc(30), sc(150), sc(26));
-    mv(ctl(h, ID_C1_EMPTY), x + sc(20), 130, cw - sc(40), sc(40));
-    mv(ctl(h, ID_C1_ERROR), x, ht - sc(16) - sc(20), cw, sc(20));
-    mv(ctl(h, ID_C1_NOTE), x, ht - sc(16) - sc(44), cw, sc(20));
+    let mut lay = Lay::new(h);
+    foot_label(h, &mut lay, ID_C1_ERROR);
+    foot_label(h, &mut lay, ID_C1_NOTE);
+    foot_buttons(h, &mut lay, &[ID_C1_ADD, ID_C1_FOLDER, ID_C1_REMOVE, ID_C1_PASTE]);
+    let lh = lay.rest() - sc(4);
+    let lv = ctl(h, ID_C1_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lh);
+    fit_columns(lv, &[45, 20, 35]);
+    mv(ctl(h, ID_C1_EMPTY), lay.x + sc(16), lay.y + lh / 2 - sc(10), lay.w - sc(32), sc(20));
 }
+
 
 unsafe extern "system" fn page_c1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
     guard(h, || page_c1_impl(h, msg, wp, lp))
@@ -2233,11 +2492,13 @@ unsafe fn page_c1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_c1(h);
             set_font_tree(h, super::fonts().normal);
             layout_c1(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_c1(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -2309,6 +2570,7 @@ unsafe fn page_c1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_CHECK_FILES;
                     }
@@ -2318,13 +2580,12 @@ unsafe fn page_c1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     0
                 }
                 PSN_KILLACTIVE => {
-                    let text = w("下一步(&N) >");
-                    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+                    restore_next(h);
                     0
                 }
                 PSN_WIZNEXT => {
                     if st(h).map(|s| s.check_items.is_empty()).unwrap_or(true) {
-                        set_text(ctl(h, ID_C1_ERROR), "请至少添加一张图片。");
+                        set_msg(h, ID_C1_ERROR, "请至少添加一张图片。");
                         return block_page(h);
                     }
                     advance_to(h, PAGE_CHECK_PROGRESS)
@@ -2336,6 +2597,7 @@ unsafe fn page_c1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_c1(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -2395,7 +2657,7 @@ fn start_check(h: HWND) {
     s.check_total = total;
     s.check_done = 0;
     pb_set(ctl(h, ID_C2_PROGRESS), 0, total);
-    set_text(ctl(h, ID_C2_STATUS), &format!("正在处理 0 / {total}…"));
+    set_msg(h, ID_C2_STATUS, &format!("正在处理 0 / {total}…"));
     unsafe { SetTimer(h, 3, 100, None) };
 }
 
@@ -2413,11 +2675,13 @@ fn build_c2(h: HWND) {
 }
 
 fn layout_c2(h: HWND) {
-    let (w, _ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_C2_PROGRESS), x, 96, cw, sc(18));
-    mv(ctl(h, ID_C2_STATUS), x, 124, cw, sc(20));
+    let mut lay = Lay::new(h);
+    lay.gap(sc(24));
+    let y = lay.take(sc(20));
+    mv(ctl(h, ID_C2_STATUS), lay.x, y, lay.w, sc(20));
+    lay.gap(sc(6));
+    let y = lay.take(sc(18));
+    mv(ctl(h, ID_C2_PROGRESS), lay.x, y, lay.w, sc(18));
 }
 
 unsafe extern "system" fn page_c2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -2431,11 +2695,13 @@ unsafe fn page_c2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_c2(h);
             set_font_tree(h, super::fonts().normal);
             layout_c2(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_c2(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -2450,6 +2716,7 @@ unsafe fn page_c2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_CHECK_PROGRESS;
                         s.history.clear();
@@ -2481,7 +2748,7 @@ unsafe fn page_c2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                             let name = s.check_items.get(index).map(check_name).unwrap_or_default();
                             let done = s.check_results.len();
                             let total = s.check_total;
-                            set_text(ctl(h, ID_C2_STATUS), &format!("正在处理 {name}（{done}/{total}）…"));
+                            set_msg(h, ID_C2_STATUS, &format!("正在处理 {name}（{done}/{total}）…"));
                         }
                     }
                     CheckMsg::Item { result } => {
@@ -2509,6 +2776,7 @@ unsafe fn page_c2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_c2(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -2627,19 +2895,24 @@ fn refresh_c3(h: HWND) {
 }
 
 fn layout_c3(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let by = ht - sc(16) - sc(28);
-    mv(ctl(h, ID_C3_LIST), x, 74, cw, sc(76));
-    mv(ctl(h, ID_C3_DETAIL), x, 156, cw, sc(44));
-    mv(ctl(h, ID_C3_SUPP), x, 206, cw, sc(28));
-    mv(ctl(h, ID_C3_NEWKEY), x, by - sc(70), cw - sc(120), sc(20));
-    mv(ctl(h, ID_C3_BACKUP), x + cw - sc(110), by - sc(74), sc(110), sc(26));
-    mv(ctl(h, ID_C3_EXPORT), x, by, sc(130), sc(28));
-    mv(ctl(h, ID_C3_REG), x + sc(138), by, sc(140), sc(28));
-    mv(ctl(h, 2030), x, by - sc(24), cw - sc(150), sc(20));
-    mv(ctl(h, ID_C3_TAB), x + cw - sc(150), by - sc(28), sc(150), sc(28));
+    let mut lay = Lay::new(h);
+    foot_buttons(h, &mut lay, &[ID_C3_EXPORT, ID_C3_REG, ID_C3_TAB]);
+    foot_label(h, &mut lay, 2030);
+    let nk = ctl(h, ID_C3_NEWKEY);
+    if unsafe { IsWindowVisible(nk) } != 0 {
+        let bw = btn_w(h, ID_C3_BACKUP);
+        let y = lay.foot(sc(BTN_H));
+        mv(nk, lay.x, y + sc(4), lay.w - bw - sc(8), sc(20));
+        mv(ctl(h, ID_C3_BACKUP), lay.x + lay.w - bw, y, bw, sc(BTN_H));
+        lay.foot(sc(ROW_GAP));
+    }
+    foot_label(h, &mut lay, ID_C3_SUPP);
+    let rest = lay.rest() - sc(6);
+    let list_h = (rest * 45 / 100).max(sc(60));
+    let lv = ctl(h, ID_C3_LIST);
+    mv(lv, lay.x, lay.y, lay.w, list_h);
+    fit_columns(lv, &[35, 65]);
+    mv(ctl(h, ID_C3_DETAIL), lay.x, lay.y + list_h + sc(6), lay.w, rest - list_h - sc(6));
 }
 
 fn c3_export(h: HWND) {
@@ -2692,11 +2965,13 @@ unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             build_c3(h);
             set_font_tree(h, super::fonts().normal);
             layout_c3(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_c3(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -2771,6 +3046,7 @@ unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             }
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_CHECK_DONE;
                     }
@@ -2786,6 +3062,7 @@ unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_c3(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -2800,10 +3077,8 @@ fn build_placeholder(h: HWND) {
 }
 
 fn layout_placeholder(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_PLACEHOLDER_BODY), x, 84, cw, (ht - 84 - sc(16)).max(sc(60)));
+    let lay = Lay::new(h);
+    mv(ctl(h, ID_PLACEHOLDER_BODY), lay.x, lay.y + sc(4), lay.w, lay.rest() - sc(4));
 }
 
 unsafe extern "system" fn page_placeholder(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -2817,11 +3092,13 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
             build_placeholder(h);
             set_font_tree(h, super::fonts().normal);
             layout_placeholder(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_placeholder(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -2833,6 +3110,7 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_PLACEHOLDER;
                     }
@@ -2852,6 +3130,7 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_placeholder(h);
+            redraw(h);
             1
         }
         _ => 0,
