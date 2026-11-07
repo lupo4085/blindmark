@@ -320,6 +320,11 @@ fn rebuild(a: &App) {
     }
 }
 
+/// Current file list, read-only (used by the setup wizard).
+pub fn files(a: &App) -> Vec<PathBuf> {
+    a.embed.items.iter().map(|i| i.path.clone()).collect()
+}
+
 fn set_row_status(a: &mut App, row: usize, s: String) {
     if let Some(it) = a.embed.items.get_mut(row) {
         it.status = s;

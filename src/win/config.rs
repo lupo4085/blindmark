@@ -34,6 +34,13 @@ pub struct Settings {
     pub window: Option<[i32; 5]>,
     /// Read an image from the clipboard when switching to the Detect tab.
     pub auto_clipboard: bool,
+    /// Show the setup wizard when the program starts.
+    #[serde(default = "yes")]
+    pub show_start_wizard: bool,
+}
+
+fn yes() -> bool {
+    true
 }
 
 pub fn app_dir() -> PathBuf {
@@ -63,6 +70,7 @@ impl Default for Settings {
             remember_window: true,
             window: None,
             auto_clipboard: false,
+            show_start_wizard: true,
         }
     }
 }
@@ -70,11 +78,6 @@ impl Default for Settings {
 impl Settings {
     fn path() -> PathBuf {
         app_dir().join("settings.json")
-    }
-
-    /// True when the wizard has never completed on this profile.
-    pub fn is_first_run() -> bool {
-        !Self::path().exists()
     }
 
     pub fn load() -> Settings {
