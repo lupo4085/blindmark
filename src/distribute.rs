@@ -116,7 +116,7 @@ pub fn distribute(files: &[PathBuf], targets: &[Target], key: &[u8], reg: &mut R
                         recipient_id: None,
                         recipient_name: Some(c.recipient.clone()),
                         source: c.source.clone(),
-                        sha256_marked: c.sha256_marked.clone(),
+                        sha256_file: c.sha256_marked.clone(),
                     })
                     .collect(),
             };
