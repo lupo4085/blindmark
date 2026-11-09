@@ -1,10 +1,13 @@
 //! blindmark — keyed, content-adaptive, screenshot-tolerant blind image watermark.
 pub mod affine;
+pub mod distribute;
 pub mod features;
 pub mod imgproc;
 pub mod jobs;
 pub mod keys;
+pub mod recipients;
 pub mod registry;
+pub mod timestamp;
 pub mod wm;
 
 use anyhow::Result;
