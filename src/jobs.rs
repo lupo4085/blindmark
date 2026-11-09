@@ -58,6 +58,88 @@ pub fn open_registry_for_write(dir: &Path, key: &[u8]) -> Result<Registry, UserE
     Ok(reg)
 }
 
+/// Read-only view of a registry folder for the wizard.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RegistryStatus {
+    New,
+    Matches { entries: usize },
+    Mismatch { fingerprint: String },
+}
+
+/// Read-only probe: never creates a folder and never writes a file.
+pub fn inspect_registry(dir: &Path, key: Option<&[u8]>) -> Result<RegistryStatus, UserError> {
+    let db = dir.join("registry.json");
+    if !db.exists() {
+        return Ok(RegistryStatus::New);
+    }
+    let parse_error = |e: anyhow::Error| UserError {
+        message: format!("无法打开登记表 {}。请检查这个文件夹是否存在、是否可以写入。", dir.display()),
+        detail: format!("{e:#}"),
+    };
+    let text = std::fs::read_to_string(&db).map_err(|e| parse_error(e.into()))?;
+    let entries: std::collections::BTreeMap<String, Entry> = serde_json::from_str(&text).map_err(|e| parse_error(e.into()))?;
+    if let Some(key) = key {
+        let mp = dir.join("meta.json");
+        if mp.exists() {
+            let meta_text = std::fs::read_to_string(&mp).map_err(|e| parse_error(e.into()))?;
+            let meta: crate::registry::Meta = serde_json::from_str(&meta_text).map_err(|e| parse_error(e.into()))?;
+            let fp = keys::fingerprint(key);
+            if meta.key_fingerprint != fp {
+                return Ok(RegistryStatus::Mismatch { fingerprint: meta.key_fingerprint });
+            }
+        }
+    }
+    Ok(RegistryStatus::Matches { entries: entries.len() })
+}
+
+fn key_create_message(path: &Path) -> String {
+    let dir = path.parent().unwrap_or(path);
+    format!("无法在 {} 创建密钥。请换一个位置。", dir.display())
+}
+
+/// Create a key file. Refuses to overwrite an existing file; returns the new key.
+pub fn create_key_file(path: &Path) -> Result<Vec<u8>, UserError> {
+    let fail = |e: anyhow::Error| UserError { message: key_create_message(path), detail: format!("{e:#}") };
+    if path.exists() {
+        return Err(UserError { message: key_create_message(path), detail: format!("{} already exists", path.display()) });
+    }
+    let key = keys::generate_key().map_err(|e| fail(e.into()))?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| fail(e.into()))?;
+    }
+    std::fs::write(path, hex::encode(key) + "\n").map_err(|e| fail(e.into()))?;
+    Ok(key.to_vec())
+}
+
+/// Read and validate a key file. The error message starts with the file name.
+pub fn read_key_file(path: &Path) -> Result<Vec<u8>, UserError> {
+    let name = file_name(path);
+    let invalid = |e: anyhow::Error| UserError {
+        message: format!("{name} 不是 BlindMark 的密钥文件。"),
+        detail: format!("{e:#}"),
+    };
+    let text = std::fs::read_to_string(path).map_err(|e| invalid(e.into()))?;
+    keys::parse_key_file(&text).map_err(|e| invalid(e))
+}
+
+/// Copy the files in `src` into `dst`, returning how many were copied.
+pub fn copy_dir(src: &Path, dst: &Path) -> Result<usize, UserError> {
+    let fail = |e: anyhow::Error| UserError {
+        message: format!("无法保存到 {}。请换一个文件夹，或检查这个文件夹是否只读。", dst.display()),
+        detail: format!("{e:#}"),
+    };
+    std::fs::create_dir_all(dst).map_err(|e| fail(e.into()))?;
+    let mut n = 0;
+    for entry in std::fs::read_dir(src).map_err(|e| fail(e.into()))? {
+        let entry = entry.map_err(|e| fail(e.into()))?;
+        if entry.file_type().map_err(|e| fail(e.into()))?.is_file() {
+            std::fs::copy(entry.path(), dst.join(entry.file_name())).map_err(|e| fail(e.into()))?;
+            n += 1;
+        }
+    }
+    Ok(n)
+}
+
 #[derive(Clone, Debug)]
 pub struct EmbedJob {
     pub files: Vec<PathBuf>,
@@ -387,6 +469,65 @@ mod tests {
             Err(e) => assert!(e.message.starts_with("无法打开 nope.png"), "{}", e.message),
             Ok(_) => panic!("a missing input must fail"),
         }
+    }
+
+    #[test]
+    fn inspect_new_dir_creates_nothing() {
+        let base = tmp("inspect-new");
+        let dir = base.join("missing");
+        assert_eq!(inspect_registry(&dir, None).unwrap(), RegistryStatus::New);
+        assert!(!dir.exists());
+    }
+
+    #[test]
+    fn inspect_detects_mismatch() {
+        let base = tmp("inspect-mismatch");
+        let dir = base.join("registry");
+        let key_a = key();
+        let key_b = key();
+        {
+            let mut reg = crate::registry::Registry::open(&dir).unwrap();
+            reg.check_key(&key_a).unwrap();
+        }
+        std::fs::write(dir.join("registry.json"), "{}").unwrap();
+        match inspect_registry(&dir, Some(&key_b)).unwrap() {
+            RegistryStatus::Mismatch { fingerprint } => assert_eq!(fingerprint, crate::keys::fingerprint(&key_a)),
+            other => panic!("expected mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn create_key_refuses_overwrite() {
+        let base = tmp("create-key");
+        let path = base.join("nested").join("blindmark.key");
+        let key = create_key_file(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(key.len(), 32);
+        let err = create_key_file(&path).unwrap_err();
+        assert!(err.message.contains("创建密钥"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+    }
+
+    #[test]
+    fn read_key_rejects_garbage() {
+        let base = tmp("read-key");
+        let path = base.join("bad.key");
+        std::fs::write(&path, "not a key").unwrap();
+        let err = read_key_file(&path).unwrap_err();
+        assert!(err.message.starts_with("bad.key"), "{}", err.message);
+    }
+
+    #[test]
+    fn copy_dir_copies_files() {
+        let base = tmp("copy-dir");
+        let src = base.join("src");
+        let dst = base.join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.json"), b"a").unwrap();
+        std::fs::write(src.join("b.png"), b"b").unwrap();
+        assert_eq!(copy_dir(&src, &dst).unwrap(), 2);
+        assert_eq!(std::fs::read(dst.join("a.json")).unwrap(), b"a");
+        assert_eq!(std::fs::read(dst.join("b.png")).unwrap(), b"b");
     }
 
     #[test]

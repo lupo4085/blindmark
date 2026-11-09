@@ -8,13 +8,24 @@
 
 use std::path::PathBuf;
 use std::ptr::{null, null_mut};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{channel, Receiver};
+use std::sync::Arc;
 
 use windows_sys::Win32::Foundation::*;
 use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::UI::Controls::*;
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyState, VK_CONTROL, VK_V};
+use windows_sys::Win32::UI::Shell::{DragAcceptFiles, HDROP};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-use super::config::Settings;
+use blindmark::jobs::{self, DetectContext, DetectResult, EmbedEvent, EmbedJob, EmbedOk, EmbedSummary, RegistryStatus, UserError};
+use blindmark::keys;
+use blindmark::registry::{load_image, RgbImageBuf};
+
+use super::config::{app_dir, Settings};
+use super::detect::SIM_OK;
+use super::embed::IMAGE_EXTS;
 use super::util::*;
 
 // ------------------------------------------------------------------ ids
@@ -22,6 +33,16 @@ use super::util::*;
 const PAGE_WELCOME: i32 = 210;
 const PAGE_TASK: i32 = 211;
 const PAGE_PLACEHOLDER: i32 = 219;
+const PAGE_SETUP_KEY: i32 = 220;
+const PAGE_SETUP_REGISTRY: i32 = 221;
+const PAGE_SETUP_DONE: i32 = 222;
+const PAGE_EMBED_FILES: i32 = 230;
+const PAGE_EMBED_OPTIONS: i32 = 231;
+const PAGE_EMBED_PROGRESS: i32 = 232;
+const PAGE_EMBED_DONE: i32 = 233;
+const PAGE_CHECK_FILES: i32 = 240;
+const PAGE_CHECK_PROGRESS: i32 = 241;
+const PAGE_CHECK_DONE: i32 = 242;
 
 const BM_WATERMARK: usize = 301;
 
@@ -32,6 +53,81 @@ const ID_TASK_RADIO: [u16; 4] = [1731, 1732, 1733, 1734];
 const ID_TASK_DESC: [u16; 4] = [1741, 1742, 1743, 1744];
 
 const ID_PLACEHOLDER_BODY: u16 = 1750;
+
+const ID_S1_NEW: u16 = 1810;
+const ID_S1_PATH: u16 = 1811;
+const ID_S1_CHANGE: u16 = 1812;
+const ID_S1_EXISTING: u16 = 1813;
+const ID_S1_BROWSE: u16 = 1814;
+const ID_S1_EXISTING_PATH: u16 = 1815;
+const ID_S1_FINGERPRINT: u16 = 1816;
+const ID_S1_HINT: u16 = 1817;
+const ID_S1_ERROR: u16 = 1818;
+
+const ID_S2_BODY: u16 = 1820;
+const ID_S2_LABEL: u16 = 1821;
+const ID_S2_DIR: u16 = 1822;
+const ID_S2_BROWSE: u16 = 1823;
+const ID_S2_STATUS: u16 = 1824;
+const ID_S2_NOTE: u16 = 1825;
+const ID_S2_ERROR: u16 = 1826;
+
+const ID_S3_BODY: u16 = 1830;
+const ID_S3_BACKUP_KEY: u16 = 1831;
+const ID_S3_BACKUP_REG: u16 = 1832;
+const ID_S3_HINT: u16 = 1833;
+
+const ID_E1_LIST: u16 = 1900;
+const ID_E1_ADD: u16 = 1901;
+const ID_E1_FOLDER: u16 = 1902;
+const ID_E1_REMOVE: u16 = 1903;
+const ID_E1_EMPTY: u16 = 1904;
+const ID_E1_ERROR: u16 = 1905;
+
+const ID_E2_NOTE: u16 = 1910;
+const ID_E2_SAME: u16 = 1911;
+const ID_E2_SPECIFIED: u16 = 1912;
+const ID_E2_OUTDIR: u16 = 1913;
+const ID_E2_BROWSE: u16 = 1914;
+const ID_E2_PNG: u16 = 1915;
+const ID_E2_JPG: u16 = 1916;
+const ID_E2_ADV: u16 = 1917;
+const ID_E2_STRENGTH: u16 = 1918;
+const ID_E2_STRENGTH_LABEL: u16 = 1919;
+const ID_E2_ERROR: u16 = 1920;
+const ID_E2_NOTE_LAST: u16 = 1921;
+
+const ID_E3_PROGRESS: u16 = 1930;
+const ID_E3_STATUS: u16 = 1931;
+
+const ID_E4_LIST: u16 = 1940;
+const ID_E4_OPEN: u16 = 1941;
+const ID_E4_REG: u16 = 1942;
+const ID_E4_TAB: u16 = 1943;
+const ID_E4_HINT: u16 = 1944;
+const ID_E4_NEWKEY: u16 = 1945;
+const ID_E4_BACKUP: u16 = 1946;
+
+const ID_C1_LIST: u16 = 2000;
+const ID_C1_ADD: u16 = 2001;
+const ID_C1_FOLDER: u16 = 2002;
+const ID_C1_REMOVE: u16 = 2003;
+const ID_C1_PASTE: u16 = 2004;
+const ID_C1_EMPTY: u16 = 2005;
+const ID_C1_ERROR: u16 = 2006;
+const ID_C1_NOTE: u16 = 2007;
+
+const ID_C2_PROGRESS: u16 = 2010;
+const ID_C2_STATUS: u16 = 2011;
+
+const ID_C3_LIST: u16 = 2020;
+const ID_C3_DETAIL: u16 = 2021;
+const ID_C3_SUPP: u16 = 2022;
+const ID_C3_EXPORT: u16 = 2023;
+const ID_C3_REG: u16 = 2024;
+const ID_C3_TAB: u16 = 2025;
+const ID_C3_NEWKEY: u16 = 2026;
+const ID_C3_BACKUP: u16 = 2027;
 
 /// `SetWindowLongPtrW` takes an `i32` index; windows-sys exposes `DWLP_MSGRESULT` as `u32`.
 const DWLP_MSGRESULT: i32 = windows_sys::Win32::UI::WindowsAndMessaging::DWLP_MSGRESULT as i32;
@@ -65,6 +161,34 @@ const PLACEHOLDER_EMBED: &str = "“给图片加水印”的向导流程会在�
 const PLACEHOLDER_DISTRIBUTE: &str = "“分发给多人”的向导流程会在后续版本中提供。现在可以先在主窗口里完成这件事：“加水印”选项卡里的“分发给多人…”。";
 const PLACEHOLDER_CHECK: &str = "“检查可疑图片”的向导流程会在后续版本中提供。现在可以先在主窗口里完成这件事：“检测”选项卡。";
 
+const S1_TITLE: &str = "创建或选择你的密钥";
+const S1_SUBTITLE: &str = "只有用这把密钥，才能读出你加的水印";
+const S1_HINT: &str = "丢了密钥，就再也读不出已加的水印。设置完成后请立即备份。";
+
+const S2_TITLE: &str = "选择登记表的保存位置";
+const S2_SUBTITLE: &str = "登记表记录每个编号对应哪张原图、发给了谁";
+const S2_BODY: &str = "它和密钥一样重要，建议放在会定期备份的位置。";
+
+const S3_TITLE: &str = "设置完成";
+const S3_SUBTITLE: &str = "现在备份你的密钥";
+const S3_BODY: &str = "把密钥文件复制到 U 盘或密码管理器里。请不要发给任何人。";
+const S3_HINT: &str = "以后可以在主窗口的“设置”选项卡里随时备份。";
+
+const E1_TITLE: &str = "选择要加水印的图片";
+const E1_SUBTITLE: &str = "可以一次添加多张，也可以添加整个文件夹";
+const E1_EMPTY: &str = "把图片拖到这里，或点“添加图片…”";
+const E2_TITLE: &str = "设置这批图片的水印";
+const E2_SUBTITLE: &str = "这些选项只用于这一次，不会改变你的默认设置";
+const E2_NOTE_CUE: &str = "例如：发到微博、给甲方的终稿";
+const E3_TITLE: &str = "正在加水印…";
+const E4_HINT: &str = "以后可以直接在主窗口的“加水印”选项卡里拖入图片完成这一步。";
+const E4_NEWKEY: &str = "你刚创建了新密钥，请记得备份。";
+
+const C1_TITLE: &str = "选择要检查的图片";
+const C2_TITLE: &str = "正在检查…";
+const C3_SUPP: &str = "没找到不代表这张图一定不是你的：图片可能被缩得太小、被重绘，或者是用另一把密钥加的水印。";
+const C3_HINT: &str = "以后可以在“检测”选项卡里直接按 Ctrl+V 粘贴截图。";
+
 // ------------------------------------------------------------------ state
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -93,6 +217,36 @@ pub struct WizardResult {
     pub show_on_start: bool,
 }
 
+#[derive(Clone)]
+enum KeyChoice {
+    New(PathBuf),
+    Existing(Option<PathBuf>),
+}
+
+enum EmbedMsg {
+    Event(EmbedEvent),
+    Done(Result<EmbedSummary, UserError>),
+}
+
+struct RunState {
+    rx: Receiver<EmbedMsg>,
+    cancel: Arc<AtomicBool>,
+    total: usize,
+    done: usize,
+}
+
+#[derive(Clone)]
+enum CheckItem {
+    File(PathBuf),
+    Clip { label: String, img: RgbImageBuf },
+}
+
+enum CheckMsg {
+    Running { index: usize },
+    Item { result: (String, Option<DetectResult>, Option<UserError>) },
+    Done { note: Option<UserError> },
+}
+
 struct St {
     ctx: WizardContext,
     task: Task,
@@ -103,6 +257,29 @@ struct St {
     bmp: HBITMAP,
     white: HBRUSH,
     panicked: bool,
+    key_choice: KeyChoice,
+    registry_dir: PathBuf,
+    new_key: Option<Vec<u8>>,
+    prefix_setup: bool,
+    created_key_path: Option<PathBuf>,
+    new_path: PathBuf,
+    files: Vec<PathBuf>,
+    note: String,
+    out_same_dir: bool,
+    out_dir: String,
+    jpeg: bool,
+    strength: f32,
+    run: Option<RunState>,
+    results: Vec<(PathBuf, Result<EmbedOk, UserError>)>,
+    stopped: bool,
+    check_items: Vec<CheckItem>,
+    check_results: Vec<(String, Option<DetectResult>, Option<UserError>)>,
+    check_rx: Option<Receiver<CheckMsg>>,
+    check_total: usize,
+    check_done: usize,
+    check_note: Option<UserError>,
+    /// The sheet's own "Next" caption, captured once so commit pages can restore it.
+    next_default: Vec<u16>,
 }
 
 /// Read the state pointer stored in `GWLP_USERDATA` by the page's `WM_INITDIALOG`.
@@ -119,6 +296,14 @@ fn st(h: HWND) -> Option<&'static mut St> {
 
 pub fn run(owner: HWND, ctx: WizardContext) -> WizardResult {
     let show_on_start = ctx.cfg.show_start_wizard;
+    let new_path = if ctx.cfg.key_path.as_os_str().is_empty() { app_dir().join("blindmark.key") } else { ctx.cfg.key_path.clone() };
+    let registry_dir = if ctx.cfg.registry_dir.as_os_str().is_empty() { app_dir().join("registry") } else { ctx.cfg.registry_dir.clone() };
+    let embed_files = ctx.embed_files.clone();
+    let note = ctx.cfg.last_channel.clone();
+    let out_same_dir = ctx.cfg.out_dir.is_empty();
+    let out_dir = ctx.cfg.out_dir.clone();
+    let jpeg = ctx.cfg.jpeg;
+    let strength = ctx.cfg.strength;
     let raw = Box::into_raw(Box::new(St {
         ctx,
         task: Task::Setup,
@@ -129,6 +314,28 @@ pub fn run(owner: HWND, ctx: WizardContext) -> WizardResult {
         bmp: null_mut(),
         white: null_mut(),
         panicked: false,
+        key_choice: KeyChoice::New(new_path.clone()),
+        registry_dir,
+        new_key: None,
+        prefix_setup: false,
+        created_key_path: None,
+        new_path,
+        files: embed_files,
+        note,
+        out_same_dir,
+        out_dir,
+        jpeg,
+        strength,
+        run: None,
+        results: Vec::new(),
+        stopped: false,
+        next_default: Vec::new(),
+        check_items: Vec::new(),
+        check_results: Vec::new(),
+        check_rx: None,
+        check_total: 0,
+        check_done: 0,
+        check_note: None,
     }));
 
     let bmp = load_bitmap(BM_WATERMARK);
@@ -141,6 +348,16 @@ pub fn run(owner: HWND, ctx: WizardContext) -> WizardResult {
     let mut pages = vec![
         page(PAGE_WELCOME, page_welcome, raw as isize),
         page(PAGE_TASK, page_task, raw as isize),
+        page(PAGE_SETUP_KEY, page_s1, raw as isize),
+        page(PAGE_SETUP_REGISTRY, page_s2, raw as isize),
+        page(PAGE_SETUP_DONE, page_s3, raw as isize),
+        page(PAGE_EMBED_FILES, page_e1, raw as isize),
+        page(PAGE_EMBED_OPTIONS, page_e2, raw as isize),
+        page(PAGE_EMBED_PROGRESS, page_e3, raw as isize),
+        page(PAGE_EMBED_DONE, page_e4, raw as isize),
+        page(PAGE_CHECK_FILES, page_c1, raw as isize),
+        page(PAGE_CHECK_PROGRESS, page_c2, raw as isize),
+        page(PAGE_CHECK_DONE, page_c3, raw as isize),
         page(PAGE_PLACEHOLDER, page_placeholder, raw as isize),
     ];
 
@@ -207,6 +424,9 @@ unsafe fn init_state(h: HWND, lp: LPARAM) {
         if state != 0 {
             SetWindowLongPtrW(h, GWLP_USERDATA, state);
         }
+        // Never paint the page background over child controls when they move.
+        let style = GetWindowLongPtrW(h, GWL_STYLE);
+        SetWindowLongPtrW(h, GWL_STYLE, style | WS_CLIPCHILDREN as isize);
     }
 }
 
@@ -246,15 +466,209 @@ fn guard<F: FnOnce() -> isize>(h: HWND, f: F) -> isize {
 // ------------------------------------------------------------------ painting
 
 /// Content area to the right of the painted watermark strip.
-const CONTENT_X: i32 = 196;
+/// Width of the painted strip and start of the content column, at 96 DPI (scaled with `sc`).
+const STRIP_W: i32 = 150;
+const CONTENT_X: i32 = 168;
 
 fn content_x(_w: i32) -> i32 {
-    CONTENT_X
+    sc(CONTENT_X)
 }
 
 fn content_w(h: HWND) -> i32 {
     let (pw, _) = client_size(h);
-    (pw - CONTENT_X - 24).max(180)
+    (pw - content_x(pw) - sc(16)).max(sc(200))
+}
+
+/// Bottom of the painted header (title, up to two subtitle lines and the rule).
+fn header_bottom() -> i32 {
+    sc(88)
+}
+
+/// Column layout for one page: content grows down from the header, footer rows are stacked
+/// up from the bottom edge, so the two never overlap.
+struct Lay {
+    x: i32,
+    w: i32,
+    y: i32,
+    bottom: i32,
+}
+
+impl Lay {
+    fn new(h: HWND) -> Lay {
+        let (cw, ht) = client_size(h);
+        Lay { x: content_x(cw), w: content_w(h), y: header_bottom(), bottom: ht - sc(10) }
+    }
+    /// Reserve `height` at the current top and return its y.
+    fn take(&mut self, height: i32) -> i32 {
+        let y = self.y;
+        self.y += height;
+        y
+    }
+    fn gap(&mut self, g: i32) {
+        self.y += g;
+    }
+    /// Reserve `height` at the bottom and return its y.
+    fn foot(&mut self, height: i32) -> i32 {
+        self.bottom -= height;
+        self.bottom
+    }
+    /// Height left between the content cursor and the footer.
+    fn rest(&self) -> i32 {
+        (self.bottom - self.y).max(sc(48))
+    }
+}
+
+/// Width of a single line of `text` in the normal font.
+fn text_w(h: HWND, text: &str) -> i32 {
+    unsafe {
+        let dc = GetDC(h);
+        let old = SelectObject(dc, super::fonts().normal as _);
+        let mut r = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        let t = w(text);
+        DrawTextW(dc, t.as_ptr(), -1, &mut r, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+        SelectObject(dc, old);
+        ReleaseDC(h, dc);
+        r.right - r.left
+    }
+}
+
+/// Natural width of a push button: its caption plus padding.
+fn btn_w(h: HWND, id: u16) -> i32 {
+    (text_w(h, &get_text(ctl(h, id))) + sc(28)).max(sc(84))
+}
+
+/// Split buttons into rows that fit `maxw`.
+fn button_rows(h: HWND, ids: &[u16], maxw: i32) -> Vec<Vec<(u16, i32)>> {
+    let mut rows: Vec<Vec<(u16, i32)>> = vec![Vec::new()];
+    let mut used = 0;
+    for &id in ids {
+        let bw = btn_w(h, id).min(maxw);
+        let need = if used == 0 { bw } else { used + sc(8) + bw };
+        if need > maxw && used > 0 {
+            rows.push(Vec::new());
+            used = bw;
+        } else {
+            used = need;
+        }
+        rows.last_mut().expect("row").push((id, bw));
+    }
+    rows
+}
+
+const BTN_H: i32 = 26;
+const ROW_GAP: i32 = 6;
+
+/// Place `ids` as one or more footer rows (bottom-up). Returns the top y of the block.
+fn foot_buttons(h: HWND, lay: &mut Lay, ids: &[u16]) -> i32 {
+    let rows = button_rows(h, ids, lay.w);
+    for row in rows.iter().rev() {
+        let y = lay.foot(sc(BTN_H));
+        let mut x = lay.x;
+        for &(id, bw) in row {
+            mv(ctl(h, id), x, y, bw, sc(BTN_H));
+            x += bw + sc(8);
+        }
+        lay.foot(sc(ROW_GAP));
+    }
+    lay.bottom
+}
+
+/// Footer label sized to its current text (hidden or empty labels take no space).
+fn foot_label(h: HWND, lay: &mut Lay, id: u16) {
+    let c = ctl(h, id);
+    let text = get_text(c);
+    if text.is_empty() || unsafe { IsWindowVisible(c) } == 0 {
+        mv(c, lay.x, lay.bottom, lay.w, 0);
+        return;
+    }
+    let lh = measure_text(h, &text, lay.w);
+    let y = lay.foot(lh);
+    mv(c, lay.x, y, lay.w, lh);
+    lay.foot(sc(4));
+}
+
+/// Content label sized to its current text.
+fn take_label(h: HWND, lay: &mut Lay, id: u16, indent: i32) {
+    let c = ctl(h, id);
+    let lw = lay.w - indent;
+    let text = get_text(c);
+    let lh = if text.is_empty() { sc(18) } else { measure_text(h, &text, lw) };
+    let y = lay.take(lh);
+    mv(c, lay.x + indent, y, lw, lh);
+}
+
+/// Spread list-view columns over the control's width by `weights`.
+fn fit_columns(lv: HWND, weights: &[i32]) {
+    let (w, _) = client_size(lv);
+    let avail = (w - sc(4)).max(sc(120));
+    let total: i32 = weights.iter().sum();
+    for (i, wt) in weights.iter().enumerate() {
+        send(lv, LVM_SETCOLUMNWIDTH, i, (avail * wt / total.max(1)) as LPARAM);
+    }
+}
+
+/// Set a message/label text and re-run the page layout, since footer heights follow the text.
+fn set_msg(h: HWND, id: u16, text: &str) {
+    if get_text(ctl(h, id)) == text {
+        return;
+    }
+    set_text(ctl(h, id), text);
+    relayout(h);
+    unsafe {
+        // Repaint the children too: the page erases its background over moved controls.
+        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
+/// Repaint the page and every control on it. Moving overlapping siblings (the empty-list
+/// hint sits on top of the list) can otherwise leave stale pixels behind.
+fn redraw(h: HWND) {
+    unsafe {
+        RedrawWindow(h, null(), null_mut(), RDW_INVALIDATE | RDW_ERASE | RDW_ALLCHILDREN);
+    }
+}
+
+/// Re-layout after a label's text changed (footer heights depend on text).
+fn relayout(h: HWND) {
+    unsafe {
+        SendMessageW(h, WM_SIZE, 0, 0);
+    }
+}
+
+/// Remember the sheet's own "Next" caption the first time any page becomes active.
+fn capture_next(h: HWND) {
+    if let Some(s) = st(h) {
+        if s.next_default.is_empty() {
+            let b = unsafe { GetDlgItem(sheet(h), 0x3024) };
+            let t = get_text(b);
+            if !t.is_empty() {
+                s.next_default = w(&t);
+            }
+        }
+    }
+}
+
+/// Ask the sheet to show `wanted` on its Next button and return what the button really
+/// shows afterwards ("下一步" when the sheet ignored the request), for the commit note.
+fn commit_label(h: HWND, wanted: &str) -> String {
+    let text = w(wanted);
+    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+    let shown = get_text(unsafe { GetDlgItem(sheet(h), 0x3024) }).replace('&', "");
+    if shown.contains(wanted) { wanted.to_string() } else { "下一步".to_string() }
+}
+
+/// Put the sheet's original "Next" caption back (used when leaving a commit page).
+fn restore_next(h: HWND) {
+    let text = st(h).map(|s| s.next_default.clone()).filter(|t| !t.is_empty()).unwrap_or_else(|| w("下一步(&N) >"));
+    send(sheet(h), PSM_SETNEXTTEXT, 0, text.as_ptr() as isize);
+}
+
+/// Add `SS_PATHELLIPSIS` so long paths in a label are shortened in the middle.
+fn path_style(c: HWND) {
+    unsafe {
+        let st = GetWindowLongPtrW(c, GWL_STYLE);
+        SetWindowLongPtrW(c, GWL_STYLE, st | 0x8000);
+    }
 }
 
 fn rgb(r: u8, g: u8, b: u8) -> u32 {
@@ -298,17 +712,17 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
         if !title.is_empty() {
             let f = super::fonts();
             let x = content_x(cw);
-            let text_w = (cw - x - 12).max(120);
+            let text_w = (cw - x - sc(12)).max(sc(120));
             SetBkMode(hdc, TRANSPARENT as i32);
             SelectObject(hdc, f.big as _);
             SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
             let t = w(title);
-            let mut r = RECT { left: x, top: 8, right: x + text_w, bottom: 40 };
+            let mut r = RECT { left: x, top: sc(10), right: x + text_w, bottom: sc(40) };
             DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
             SelectObject(hdc, f.normal as _);
             let t = w(subtitle);
-            let mut r = RECT { left: x, top: 38, right: x + text_w, bottom: 66 };
-            DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
+            let mut r = RECT { left: x, top: sc(42), right: x + text_w, bottom: sc(80) };
+            DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS | DT_EDITCONTROL);
         }
         return;
     }
@@ -317,10 +731,10 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
 
     let bmp = st(h).map(|s| s.bmp).unwrap_or(null_mut());
     if !bmp.is_null() {
-        let strip = content_x(cw) - 8;
+        let strip = sc(STRIP_W);
         let mem = CreateCompatibleDC(hdc);
         let old = SelectObject(mem, bmp as _);
-        StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 164, 314, SRCCOPY);
+        StretchBlt(hdc, 0, 0, strip, ht, mem, 0, 0, 150, 380, SRCCOPY);
         SelectObject(mem, old);
         DeleteDC(mem);
     }
@@ -331,16 +745,16 @@ unsafe fn paint_banner(h: HWND, hdc: HDC, title: &str, subtitle: &str) {
         SetBkMode(hdc, TRANSPARENT as i32);
         SelectObject(hdc, f.big as _);
         SetTextColor(hdc, rgb(28, 32, 36));
-        let text_w = (cw - x - 12).max(120);
+        let text_w = (cw - x - sc(12)).max(sc(120));
         let t = w(title);
-        let mut r = RECT { left: x, top: 8, right: x + text_w, bottom: 40 };
+        let mut r = RECT { left: x, top: sc(10), right: x + text_w, bottom: sc(40) };
         DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX);
         SelectObject(hdc, f.normal as _);
         SetTextColor(hdc, rgb(96, 104, 112));
         let t = w(subtitle);
-        let mut r = RECT { left: x, top: 38, right: x + text_w, bottom: 66 };
-        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX);
-        let line = RECT { left: x, top: 68, right: cw - 12, bottom: 69 };
+        let mut r = RECT { left: x, top: sc(42), right: x + text_w, bottom: sc(80) };
+        DrawTextW(hdc, t.as_ptr(), -1, &mut r, DT_LEFT | DT_WORDBREAK | DT_NOPREFIX | DT_END_ELLIPSIS | DT_EDITCONTROL);
+        let line = RECT { left: x, top: sc(82), right: cw - sc(12), bottom: sc(82) + 1 };
         fill(hdc, &line, rgb(226, 230, 234));
     }
 }
@@ -402,6 +816,86 @@ fn go_back(h: HWND) -> isize {
     1
 }
 
+/// Move to `target`, remembering the current page for "上一步".
+fn advance_to(h: HWND, target: i32) -> isize {
+    if let Some(s) = st(h) {
+        s.history.push(s.cur);
+    }
+    unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT, target as isize); };
+    1
+}
+
+/// Kept as a named constant so the only literal `-1` result remains `go_back`'s "no page" case.
+const NO_RESULT: isize = -1;
+
+/// Keep the page active (`DWLP_MSGRESULT = -1`).
+fn block_page(h: HWND) -> isize {
+    unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT, NO_RESULT); };
+    1
+}
+
+fn step_y(s: &St) -> i32 {
+    match s.task {
+        Task::Embed => if s.prefix_setup { 5 } else { 3 },
+        Task::Check => if s.prefix_setup { 4 } else { 2 },
+        _ => 2,
+    }
+}
+
+fn step_text(x: i32, y: i32, base: &str) -> String {
+    if base.is_empty() {
+        format!("第 {x} 步，共 {y} 步")
+    } else {
+        format!("第 {x} 步，共 {y} 步 · {base}")
+    }
+}
+
+/// A small TaskDialog with custom buttons. Returns the pressed button ID (0 = closed).
+fn task_dialog(owner: HWND, text: &str, buttons: &[(i32, &str)]) -> i32 {
+    unsafe {
+        let title = w("BlindMark 向导");
+        let main = w(text);
+        let texts: Vec<Vec<u16>> = buttons.iter().map(|(_, s)| w(s)).collect();
+        let items: Vec<TASKDIALOG_BUTTON> = buttons
+            .iter()
+            .zip(&texts)
+            .map(|((id, _), s)| TASKDIALOG_BUTTON { nButtonID: *id, pszButtonText: s.as_ptr() })
+            .collect();
+        let mut cfg: TASKDIALOGCONFIG = std::mem::zeroed();
+        cfg.cbSize = std::mem::size_of::<TASKDIALOGCONFIG>() as u32;
+        cfg.hwndParent = owner;
+        cfg.dwFlags = TDF_ALLOW_DIALOG_CANCELLATION | TDF_POSITION_RELATIVE_TO_WINDOW;
+        cfg.pszWindowTitle = title.as_ptr();
+        cfg.Anonymous1 = TASKDIALOGCONFIG_0 { pszMainIcon: null() };
+        cfg.pszMainInstruction = main.as_ptr();
+        cfg.cButtons = items.len() as u32;
+        cfg.pButtons = items.as_ptr();
+        cfg.nDefaultButton = buttons.first().map(|(id, _)| *id).unwrap_or(0);
+        let mut pressed = 0i32;
+        TaskDialogIndirect(&cfg, &mut pressed, null_mut(), null_mut());
+        pressed
+    }
+}
+
+/// Red for the S1 hint/error labels and the S2 mismatch/error labels.
+unsafe fn on_ctlcolor_red(h: HWND, hdc: HDC, child: HWND) -> isize {
+    SetBkMode(hdc, OPAQUE as i32);
+    if high_contrast() {
+        SetTextColor(hdc, GetSysColor(COLOR_WINDOWTEXT));
+        return GetSysColorBrush(COLOR_WINDOW) as isize;
+    }
+    let mut red = child == ctl(h, ID_S1_HINT)
+        || child == ctl(h, ID_S1_ERROR)
+        || child == ctl(h, ID_S2_ERROR)
+        || child == ctl(h, ID_E1_ERROR)
+        || child == ctl(h, ID_E2_ERROR);
+    if child == ctl(h, ID_S2_STATUS) && get_text(child).starts_with("这个登记表属于另一把密钥") {
+        red = true;
+    }
+    SetTextColor(hdc, if red { rgb(176, 0, 32) } else { rgb(32, 36, 40) });
+    st(h).map(|s| s.white as isize).unwrap_or(0)
+}
+
 fn label_id(parent: HWND, id: u16, text: &str) -> HWND {
     create(windows_sys::core::w!("STATIC"), text, 0, 0, parent, id)
 }
@@ -457,15 +951,13 @@ fn build_welcome(h: HWND) {
 }
 
 fn layout_welcome(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    let check_h = sc(22);
-    let check_y = ht - sc(14) - check_h;
-    mv(ctl(h, ID_SHOW_ON_START), x, check_y, cw, check_h);
-    let body_y = 76;
-    let body_h = (check_y - sc(6) - body_y).max(sc(60));
-    mv(ctl(h, ID_WELCOME_BODY), x, body_y, cw, body_h);
+    let mut lay = Lay::new(h);
+    let y = lay.foot(sc(24));
+    mv(ctl(h, ID_SHOW_ON_START), lay.x, y, lay.w, sc(24));
+    lay.foot(sc(6));
+    lay.gap(sc(4));
+    let body_h = lay.rest();
+    mv(ctl(h, ID_WELCOME_BODY), lay.x, lay.y, lay.w, body_h);
 }
 
 unsafe extern "system" fn page_welcome(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -479,11 +971,13 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
             build_welcome(h);
             set_font_tree(h, super::fonts().normal);
             layout_welcome(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_welcome(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -504,6 +998,7 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_WELCOME;
                     }
@@ -523,6 +1018,7 @@ unsafe fn page_welcome_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize 
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_welcome(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -542,19 +1038,16 @@ fn build_task(h: HWND) {
 }
 
 fn layout_task(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
+    let mut lay = Lay::new(h);
     let key_present = st(h).map(|s| s.ctx.key.is_some()).unwrap_or(false);
-    let desc_w = cw.max(sc(80));
-    let heights: Vec<i32> = (0..4).map(|i| measure_text(h, task_desc(i, key_present), desc_w)).collect();
-    let total: i32 = 4 * sc(22) + 4 * sc(6) + heights.iter().sum::<i32>();
-    let bottom = ht - sc(16);
-    let mut y = if 78 + total <= bottom { 78 } else { (bottom - total).max(74) };
+    lay.gap(sc(4));
     for i in 0..4 {
-        mv(ctl(h, ID_TASK_RADIO[i]), x, y, cw, sc(22));
-        mv(ctl(h, ID_TASK_DESC[i]), x, y + sc(20), desc_w, heights[i]);
-        y += sc(22) + heights[i] + sc(6);
+        let y = lay.take(sc(22));
+        mv(ctl(h, ID_TASK_RADIO[i]), lay.x, y, lay.w, sc(22));
+        let dh = measure_text(h, task_desc(i, key_present), lay.w - sc(20));
+        let y = lay.take(dh);
+        mv(ctl(h, ID_TASK_DESC[i]), lay.x + sc(20), y, lay.w - sc(20), dh);
+        lay.gap(sc(10));
     }
 }
 
@@ -572,11 +1065,13 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                 set_font(ctl(h, id), super::fonts().bold);
             }
             layout_task(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_task(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -589,6 +1084,7 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_TASK;
                         if !ID_TASK_RADIO.iter().any(|&id| checked(ctl(h, id))) {
@@ -609,9 +1105,17 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                     }
                     if let Some(s) = st(h) {
                         s.task = chosen;
+                        s.prefix_setup = matches!(chosen, Task::Embed | Task::Check) && s.ctx.key.is_none();
                         s.history.push(s.cur);
                     }
-                    unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT, PAGE_PLACEHOLDER as isize) };
+                    let has_key = st(h).map(|s| s.ctx.key.is_some()).unwrap_or(false);
+                    let target = match chosen {
+                        Task::Setup => PAGE_SETUP_KEY,
+                        Task::Embed => if has_key { PAGE_EMBED_FILES } else { PAGE_SETUP_KEY },
+                        Task::Check => if has_key { PAGE_CHECK_FILES } else { PAGE_SETUP_KEY },
+                        Task::Distribute => PAGE_PLACEHOLDER,
+                    };
+                    unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT, target as isize) };
                     1
                 }
                 PSN_WIZBACK => go_back(h),
@@ -621,6 +1125,1944 @@ unsafe fn page_task_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_task(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ------------------------------------------------------------------ page 220: S1 key
+
+fn build_s1(h: HWND) {
+    radio(h, ID_S1_NEW, "新建一把密钥（推荐）", true);
+    label_id(h, ID_S1_PATH, "");
+    button(h, ID_S1_CHANGE, "更改位置…");
+    radio(h, ID_S1_EXISTING, "使用已有的密钥文件", false);
+    button(h, ID_S1_BROWSE, "浏览…");
+    label_id(h, ID_S1_EXISTING_PATH, "");
+    label_id(h, ID_S1_FINGERPRINT, "");
+    label_id(h, ID_S1_HINT, S1_HINT);
+    label_id(h, ID_S1_ERROR, "");
+    path_style(ctl(h, ID_S1_PATH));
+    path_style(ctl(h, ID_S1_EXISTING_PATH));
+    refresh_s1(h);
+}
+
+fn refresh_s1(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let new_path = s.new_path.clone();
+    let existing = match &s.key_choice {
+        KeyChoice::Existing(p) => p.clone(),
+        KeyChoice::New(_) => None,
+    };
+    let is_existing = matches!(s.key_choice, KeyChoice::Existing(_));
+    set_check(ctl(h, ID_S1_NEW), !is_existing);
+    set_check(ctl(h, ID_S1_EXISTING), is_existing);
+    enable(ctl(h, ID_S1_CHANGE), !is_existing);
+    enable(ctl(h, ID_S1_PATH), !is_existing);
+    enable(ctl(h, ID_S1_BROWSE), is_existing);
+    set_text(ctl(h, ID_S1_PATH), &format!("保存位置：{}", new_path.display()));
+    match &existing {
+        Some(p) => {
+            set_msg(h, ID_S1_EXISTING_PATH, &p.display().to_string());
+            match jobs::read_key_file(p) {
+                Ok(k) => set_msg(h, ID_S1_FINGERPRINT, &format!("密钥指纹：{}（用来核对是不是同一把密钥）", keys::fingerprint(&k))),
+                Err(_) => set_msg(h, ID_S1_FINGERPRINT, ""),
+            }
+        }
+        None => {
+            set_msg(h, ID_S1_EXISTING_PATH, "");
+            set_msg(h, ID_S1_FINGERPRINT, "");
+        }
+    }
+}
+
+fn layout_s1(h: HWND) {
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    let ind = sc(20);
+    lay.gap(sc(2));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_S1_NEW), x, y, cw, sc(22));
+    let cbw = btn_w(h, ID_S1_CHANGE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S1_PATH), x + ind, y + sc(4), cw - ind - cbw - sc(8), sc(20));
+    mv(ctl(h, ID_S1_CHANGE), x + cw - cbw, y, cbw, sc(BTN_H));
+    lay.gap(sc(10));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_S1_EXISTING), x, y, cw, sc(22));
+    let bbw = btn_w(h, ID_S1_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S1_BROWSE), x + ind, y, bbw, sc(BTN_H));
+    mv(ctl(h, ID_S1_EXISTING_PATH), x + ind + bbw + sc(8), y + sc(4), cw - ind - bbw - sc(8), sc(20));
+    take_label(h, &mut lay, ID_S1_FINGERPRINT, ind);
+    foot_label(h, &mut lay, ID_S1_ERROR);
+    foot_label(h, &mut lay, ID_S1_HINT);
+}
+
+unsafe extern "system" fn page_s1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_s1_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_s1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_s1(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_s1(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_s1(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(2);
+            let sub = step_text(1, y, S1_SUBTITLE);
+            paint_banner(h, wp as HDC, S1_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_red(h, wp as HDC, lp as HWND),
+        WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_S1_NEW => {
+                    if let Some(s) = st(h) {
+                        let p = s.new_path.clone();
+                        s.key_choice = KeyChoice::New(p);
+                    }
+                    set_msg(h, ID_S1_ERROR, "");
+                    refresh_s1(h);
+                    1
+                }
+                ID_S1_EXISTING => {
+                    if let Some(s) = st(h) {
+                        let existing = match &s.key_choice {
+                            KeyChoice::Existing(p) => p.clone(),
+                            KeyChoice::New(_) => None,
+                        };
+                        s.key_choice = KeyChoice::Existing(existing);
+                    }
+                    refresh_s1(h);
+                    1
+                }
+                ID_S1_CHANGE => {
+                    if let Some(p) = save_file(h, "选择密钥保存位置", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", "blindmark.key", "key") {
+                        if let Some(s) = st(h) {
+                            s.new_path = p.clone();
+                            s.key_choice = KeyChoice::New(p);
+                        }
+                        set_msg(h, ID_S1_ERROR, "");
+                        refresh_s1(h);
+                    }
+                    1
+                }
+                ID_S1_BROWSE => {
+                    if let Some(p) = open_files(h, "选择密钥文件", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", false).into_iter().next() {
+                        if let Some(s) = st(h) {
+                            s.key_choice = KeyChoice::Existing(Some(p.clone()));
+                        }
+                        match jobs::read_key_file(&p) {
+                            Ok(_) => set_msg(h, ID_S1_ERROR, ""),
+                            Err(e) => set_msg(h, ID_S1_ERROR, &e.message),
+                        }
+                        refresh_s1(h);
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_SETUP_KEY;
+                    }
+                    refresh_s1(h);
+                    set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
+                    0
+                }
+                PSN_WIZNEXT => {
+                    let choice = st(h).map(|s| s.key_choice.clone()).unwrap_or(KeyChoice::Existing(None));
+                    match choice {
+                        KeyChoice::New(path) => {
+                            if path.exists() {
+                                match jobs::read_key_file(&path) {
+                                    Ok(k) => {
+                                        let fp = keys::fingerprint(&k);
+                                        let question = format!("这里已经有一把密钥（密钥指纹 {fp}）。要直接使用它吗？");
+                                        let pressed = task_dialog(h, &question, &[(1, "使用这把密钥"), (2, "换个位置")]);
+                                        if pressed == 1 {
+                                            if let Some(s) = st(h) {
+                                                s.key_choice = KeyChoice::Existing(Some(path));
+                                            }
+                                            refresh_s1(h);
+                                            return advance_to(h, PAGE_SETUP_REGISTRY);
+                                        }
+                                        return block_page(h);
+                                    }
+                                    Err(e) => {
+                                        set_msg(h, ID_S1_ERROR, &e.message);
+                                        return block_page(h);
+                                    }
+                                }
+                            }
+                            advance_to(h, PAGE_SETUP_REGISTRY)
+                        }
+                        KeyChoice::Existing(Some(path)) => match jobs::read_key_file(&path) {
+                            Ok(_) => advance_to(h, PAGE_SETUP_REGISTRY),
+                            Err(e) => {
+                                set_msg(h, ID_S1_ERROR, &e.message);
+                                block_page(h)
+                            }
+                        },
+                        KeyChoice::Existing(None) => {
+                            set_msg(h, ID_S1_ERROR, "请先新建一把密钥，或选择已有的密钥文件。");
+                            block_page(h)
+                        }
+                    }
+                }
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_s1(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ------------------------------------------------------------------ page 221: S2 registry
+
+fn build_s2(h: HWND) {
+    let dir = st(h).map(|s| s.registry_dir.display().to_string()).unwrap_or_default();
+    label_id(h, ID_S2_BODY, S2_BODY);
+    label_id(h, ID_S2_LABEL, "位置");
+    edit(h, ID_S2_DIR, &dir);
+    button(h, ID_S2_BROWSE, "浏览…");
+    label_id(h, ID_S2_STATUS, "");
+    label_id(h, ID_S2_NOTE, "");
+    label_id(h, ID_S2_ERROR, "");
+    refresh_s2(h);
+}
+
+fn refresh_s2(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let dir = PathBuf::from(get_text(ctl(h, ID_S2_DIR)).trim());
+    if dir.as_os_str().is_empty() {
+        set_msg(h, ID_S2_STATUS, "");
+        return;
+    }
+    let key = match &s.key_choice {
+        KeyChoice::Existing(Some(p)) => jobs::read_key_file(p).ok(),
+        _ => None,
+    };
+    match jobs::inspect_registry(&dir, key.as_deref()) {
+        Ok(RegistryStatus::New) => set_msg(h, ID_S2_STATUS, "这是一个新的登记表。"),
+        Ok(RegistryStatus::Matches { entries }) => {
+            let text = if key.is_some() { format!("已有登记表，共 {entries} 条记录，与所选密钥匹配。") } else { format!("已有登记表，共 {entries} 条记录。") };
+            set_msg(h, ID_S2_STATUS, &text);
+        }
+        Ok(RegistryStatus::Mismatch { fingerprint }) => set_msg(h, ID_S2_STATUS, &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
+        ),
+        Err(e) => set_msg(h, ID_S2_STATUS, &e.message),
+    }
+}
+
+fn set_submit_text(h: HWND) {
+    let button = if st(h).map(|s| s.task == Task::Setup).unwrap_or(true) { "保存设置" } else { "保存并继续" };
+    let label = commit_label(h, button);
+    set_msg(h, ID_S2_NOTE, &format!("点击“{label}”后会保存设置。"));
+}
+
+fn layout_s2(h: HWND) {
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    take_label(h, &mut lay, ID_S2_BODY, 0);
+    lay.gap(sc(10));
+    let lw = text_w(h, "位置") + sc(10);
+    let bw = btn_w(h, ID_S2_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_S2_LABEL), x, y + sc(4), lw, sc(20));
+    mv(ctl(h, ID_S2_DIR), x + lw, y + sc(1), cw - lw - bw - sc(8), sc(24));
+    mv(ctl(h, ID_S2_BROWSE), x + cw - bw, y, bw, sc(BTN_H));
+    lay.gap(sc(4));
+    take_label(h, &mut lay, ID_S2_STATUS, 0);
+    foot_label(h, &mut lay, ID_S2_ERROR);
+    foot_label(h, &mut lay, ID_S2_NOTE);
+}
+
+unsafe extern "system" fn page_s2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_s2_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_s2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_s2(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_s2(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_s2(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(2);
+            let sub = step_text(2, y, S2_SUBTITLE);
+            paint_banner(h, wp as HDC, S2_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_red(h, wp as HDC, lp as HWND),
+        WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_COMMAND => {
+            let id = (wp & 0xffff) as u16;
+            let code = ((wp >> 16) & 0xffff) as u32;
+            if id == ID_S2_BROWSE && code == BN_CLICKED {
+                if let Some(d) = pick_folder(h, "选择登记表文件夹") {
+                    set_text(ctl(h, ID_S2_DIR), &d.display().to_string());
+                    refresh_s2(h);
+                }
+                return 1;
+            }
+            if id == ID_S2_DIR && code == EN_CHANGE {
+                unsafe { SetTimer(h, 0x7B, 300, None) };
+                return 1;
+            }
+            0
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_SETUP_REGISTRY;
+                    }
+                    refresh_s2(h);
+                    set_submit_text(h);
+                    set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
+                    0
+                }
+                PSN_KILLACTIVE => {
+                    restore_next(h);
+                    0
+                }
+                PSN_WIZNEXT => {
+                    let dir = PathBuf::from(get_text(ctl(h, ID_S2_DIR)).trim());
+                    if dir.as_os_str().is_empty() {
+                        set_msg(h, ID_S2_ERROR, "请选择登记表的保存位置。");
+                        return block_page(h);
+                    }
+                    let choice = st(h).map(|s| s.key_choice.clone()).unwrap_or(KeyChoice::Existing(None));
+                    let (key, key_path) = match choice {
+                        KeyChoice::New(path) => match jobs::create_key_file(&path) {
+                            Ok(k) => {
+                                if let Some(s) = st(h) {
+                                    s.new_key = Some(k.clone());
+                                    s.created_key_path = Some(path.clone());
+                                    s.key_choice = KeyChoice::Existing(Some(path.clone()));
+                                }
+                                (k, path)
+                            }
+                            Err(e) => {
+                                set_msg(h, ID_S2_ERROR, &e.message);
+                                return block_page(h);
+                            }
+                        },
+                        KeyChoice::Existing(Some(path)) => match jobs::read_key_file(&path) {
+                            Ok(k) => (k, path),
+                            Err(e) => {
+                                set_msg(h, ID_S2_ERROR, &e.message);
+                                return block_page(h);
+                            }
+                        },
+                        KeyChoice::Existing(None) => {
+                            set_msg(h, ID_S2_ERROR, "请先新建一把密钥，或选择已有的密钥文件。");
+                            return block_page(h);
+                        }
+                    };
+                    match jobs::inspect_registry(&dir, Some(&key)) {
+                        Ok(RegistryStatus::Mismatch { fingerprint }) => {
+                            set_msg(h, ID_S2_ERROR, "");
+                            set_msg(h, ID_S2_STATUS, &format!("这个登记表属于另一把密钥（密钥指纹 {fingerprint}），不能和所选密钥一起使用。"),
+                            );
+                            return block_page(h);
+                        }
+                        Ok(_) => {}
+                        Err(e) => {
+                            set_msg(h, ID_S2_ERROR, &e.message);
+                            return block_page(h);
+                        }
+                    }
+                    if let Err(e) = jobs::open_registry_for_write(&dir, &key) {
+                        set_msg(h, ID_S2_ERROR, &e.message);
+                        return block_page(h);
+                    }
+                    let target = match st(h).map(|s| s.task).unwrap_or(Task::Setup) {
+                        Task::Setup => PAGE_SETUP_DONE,
+                        Task::Embed => PAGE_EMBED_FILES,
+                        Task::Check => PAGE_CHECK_FILES,
+                        _ => PAGE_PLACEHOLDER,
+                    };
+                    if let Some(s) = st(h) {
+                        s.ctx.key = Some(key);
+                        s.ctx.cfg.key_path = key_path.clone();
+                        s.ctx.cfg.registry_dir = dir.clone();
+                        s.registry_dir = dir.clone();
+                        s.outcome = WizardOutcome::SettingsChanged { key_path, registry_dir: dir };
+                    }
+                    advance_to(h, target)
+                }
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7B => {
+            unsafe { KillTimer(h, 0x7B) };
+            refresh_s2(h);
+            1
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_s2(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ------------------------------------------------------------------ page 222: S3 done
+
+fn build_s3(h: HWND) {
+    label_id(h, ID_S3_BODY, S3_BODY);
+    button(h, ID_S3_BACKUP_KEY, "备份密钥…");
+    button(h, ID_S3_BACKUP_REG, "备份登记表…");
+    label_id(h, ID_S3_HINT, S3_HINT);
+}
+
+fn layout_s3(h: HWND) {
+    let mut lay = Lay::new(h);
+    take_label(h, &mut lay, ID_S3_BODY, 0);
+    lay.gap(sc(12));
+    let rows = button_rows(h, &[ID_S3_BACKUP_KEY, ID_S3_BACKUP_REG], lay.w);
+    for row in rows {
+        let y = lay.take(sc(BTN_H));
+        let mut x = lay.x;
+        for (id, bw) in row {
+            mv(ctl(h, id), x, y, bw, sc(BTN_H));
+            x += bw + sc(8);
+        }
+        lay.gap(sc(ROW_GAP));
+    }
+    lay.gap(sc(8));
+    take_label(h, &mut lay, ID_S3_HINT, 0);
+}
+
+unsafe extern "system" fn page_s3(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_s3_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_s3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_s3(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_s3(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_s3(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            paint_banner(h, wp as HDC, S3_TITLE, S3_SUBTITLE);
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_S3_BACKUP_KEY => {
+                    let key_path = st(h).map(|s| s.ctx.cfg.key_path.clone()).unwrap_or_default();
+                    let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
+                    if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
+                        match std::fs::copy(&key_path, &p) {
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
+                        }
+                    }
+                    1
+                }
+                ID_S3_BACKUP_REG => {
+                    let reg_dir = st(h).map(|s| s.registry_dir.clone()).unwrap_or_default();
+                    if let Some(d) = pick_folder(h, "选择备份保存位置") {
+                        let dest = d.join(format!("blindmark-registry-backup-{}", chrono::Local::now().format("%Y%m%d")));
+                        match jobs::copy_dir(&reg_dir, &dest) {
+                            Ok(n) => info(h, &format!("登记表已备份到 {}（{n} 个文件）。", dest.display())),
+                            Err(e) => {
+                                eprintln!("{}", e.detail);
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
+                        }
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_SETUP_DONE;
+                    }
+                    set_buttons(h, PSWIZB_FINISH);
+                    0
+                }
+                PSN_WIZBACK => block_page(h),
+                PSN_WIZFINISH => 0,
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_s3(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ------------------------------------------------------------------ page 230..233: embed
+
+fn name_of(p: &std::path::Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default()
+}
+
+fn images_in(dir: &std::path::Path) -> Vec<PathBuf> {
+    std::fs::read_dir(dir)
+        .map(|rd| {
+            rd.filter_map(|e| e.ok().map(|e| e.path()))
+                .filter(|p| {
+                    p.is_file()
+                        && p.extension()
+                            .and_then(|e| e.to_str())
+                            .map(|e| IMAGE_EXTS.contains(&e.to_ascii_lowercase().as_str()))
+                            .unwrap_or(false)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn add_paths(s: &mut St, paths: Vec<PathBuf>) {
+    for p in paths {
+        if p.is_file() && !s.files.contains(&p) {
+            s.files.push(p);
+        }
+    }
+}
+
+fn keep_open(h: HWND) -> isize {
+    unsafe { SetWindowLongPtrW(h, DWLP_MSGRESULT, 1); };
+    1
+}
+
+// ----- E1
+
+fn build_e1(h: HWND) {
+    let lv = listview(h, ID_E1_LIST, false);
+    lv_column(lv, 0, "文件", sc(200), false);
+    lv_column(lv, 1, "尺寸", sc(90), false);
+    lv_column(lv, 2, "位置", sc(220), false);
+    button(h, ID_E1_ADD, "添加图片…");
+    button(h, ID_E1_FOLDER, "添加文件夹…");
+    button(h, ID_E1_REMOVE, "移除");
+    label_id(h, ID_E1_EMPTY, E1_EMPTY);
+    label_id(h, ID_E1_ERROR, "");
+    unsafe { DragAcceptFiles(h, 1) };
+    refresh_e1(h);
+}
+
+fn refresh_e1(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let lv = ctl(h, ID_E1_LIST);
+    lv_clear(lv);
+    for (i, p) in s.files.iter().enumerate() {
+        let dims = image::image_dimensions(p).map(|(w, h)| format!("{w} × {h}")).unwrap_or_else(|_| "—".into());
+        let dir = p.parent().map(|d| d.display().to_string()).unwrap_or_default();
+        lv_add(lv, &[&name_of(p), &dims, &dir], i as isize);
+    }
+    show(ctl(h, ID_E1_EMPTY), s.files.is_empty());
+}
+
+fn layout_e1(h: HWND) {
+    let mut lay = Lay::new(h);
+    foot_label(h, &mut lay, ID_E1_ERROR);
+    foot_buttons(h, &mut lay, &[ID_E1_ADD, ID_E1_FOLDER, ID_E1_REMOVE]);
+    let lh = lay.rest() - sc(4);
+    let lv = ctl(h, ID_E1_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lh);
+    fit_columns(lv, &[45, 20, 35]);
+    mv(ctl(h, ID_E1_EMPTY), lay.x + sc(16), lay.y + lh / 2 - sc(10), lay.w - sc(32), sc(20));
+}
+
+unsafe extern "system" fn page_e1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_e1_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_e1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_e1(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_e1(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_e1(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(3);
+            let x = if st(h).map(|s| s.prefix_setup).unwrap_or(false) { 3 } else { 1 };
+            let sub = step_text(x, y, E1_SUBTITLE);
+            paint_banner(h, wp as HDC, E1_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_red(h, wp as HDC, lp as HWND),
+        WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_DROPFILES => {
+            let paths = dropped_files(wp as HDROP);
+            if let Some(s) = st(h) {
+                add_paths(s, paths);
+            }
+            refresh_e1(h);
+            1
+        }
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_E1_ADD => {
+                    let paths = open_files(h, "添加图片", IMAGE_FILTER, true);
+                    if let Some(s) = st(h) {
+                        add_paths(s, paths);
+                    }
+                    refresh_e1(h);
+                    1
+                }
+                ID_E1_FOLDER => {
+                    if let Some(d) = pick_folder(h, "选择包含图片的文件夹（不含子文件夹）") {
+                        if let Some(s) = st(h) {
+                            add_paths(s, images_in(&d));
+                        }
+                        refresh_e1(h);
+                    }
+                    1
+                }
+                ID_E1_REMOVE => {
+                    let sel = lv_selected(ctl(h, ID_E1_LIST));
+                    if let Some(s) = st(h) {
+                        for i in sel.into_iter().rev() {
+                            if (i as usize) < s.files.len() {
+                                s.files.remove(i as usize);
+                            }
+                        }
+                    }
+                    refresh_e1(h);
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_EMBED_FILES;
+                    }
+                    refresh_e1(h);
+                    set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
+                    0
+                }
+                PSN_WIZNEXT => {
+                    if st(h).map(|s| s.files.is_empty()).unwrap_or(true) {
+                        set_msg(h, ID_E1_ERROR, "请至少添加一张图片。");
+                        return block_page(h);
+                    }
+                    advance_to(h, PAGE_EMBED_OPTIONS)
+                }
+                PSN_WIZBACK => go_back(h),
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_e1(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ----- E2
+
+fn e2_strength(h: HWND) -> f32 {
+    tb_get(ctl(h, ID_E2_STRENGTH)) as f32 / 10.0
+}
+
+fn update_strength_label(h: HWND) {
+    let v = e2_strength(h);
+    let tier = if v < 2.0 { "较弱" } else if v <= 2.8 { "标准" } else { "较强" };
+    set_text(ctl(h, ID_E2_STRENGTH_LABEL), &format!("{tier}（{v:.1}）"));
+}
+
+fn refresh_e2_enabled(h: HWND) {
+    let same = checked(ctl(h, ID_E2_SAME));
+    enable(ctl(h, ID_E2_OUTDIR), !same);
+    enable(ctl(h, ID_E2_BROWSE), !same);
+}
+
+fn set_submit_text_e2(h: HWND) {
+    let label = commit_label(h, "开始加水印");
+    set_msg(h, ID_E2_NOTE_LAST, &format!("点击“{label}”后开始加水印，已完成的部分无法通过“上一步”撤销。"));
+}
+
+fn build_e2(h: HWND) {
+    let Some(s) = st(h) else { return };
+    label_id(h, 2020, "备注（可选）");
+    edit(h, ID_E2_NOTE, &s.note);
+    cue(ctl(h, ID_E2_NOTE), E2_NOTE_CUE);
+    radio(h, ID_E2_SAME, "和原图放在同一文件夹", true);
+    radio(h, ID_E2_SPECIFIED, "指定文件夹：", false);
+    edit(h, ID_E2_OUTDIR, &s.out_dir);
+    button(h, ID_E2_BROWSE, "浏览…");
+    label_id(h, 2021, "格式");
+    radio(h, ID_E2_PNG, "PNG（推荐，画质无损）", true);
+    radio(h, ID_E2_JPG, &format!("JPEG（质量 {}）", s.ctx.cfg.jpeg_quality), false);
+    button(h, ID_E2_ADV, "显示高级选项");
+    trackbar(h, ID_E2_STRENGTH, 15, 40);
+    tb_set(ctl(h, ID_E2_STRENGTH), (s.strength * 10.0).round() as i32);
+    label_id(h, ID_E2_STRENGTH_LABEL, "");
+    label_id(h, ID_E2_ERROR, "");
+    label_id(h, ID_E2_NOTE_LAST, "");
+    set_check(ctl(h, ID_E2_SAME), s.out_same_dir);
+    set_check(ctl(h, ID_E2_SPECIFIED), !s.out_same_dir);
+    set_check(ctl(h, ID_E2_PNG), !s.jpeg);
+    set_check(ctl(h, ID_E2_JPG), s.jpeg);
+    show(ctl(h, ID_E2_STRENGTH), false);
+    show(ctl(h, ID_E2_STRENGTH_LABEL), false);
+    update_strength_label(h);
+    refresh_e2_enabled(h);
+    set_submit_text_e2(h);
+}
+
+fn layout_e2(h: HWND) {
+    let mut lay = Lay::new(h);
+    let (x, cw) = (lay.x, lay.w);
+    let y = lay.take(sc(20));
+    mv(ctl(h, 2020), x, y, cw, sc(20));
+    let y = lay.take(sc(28));
+    mv(ctl(h, ID_E2_NOTE), x, y, cw, sc(24));
+    lay.gap(sc(6));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_SAME), x, y, cw, sc(22));
+    let rw = text_w(h, &get_text(ctl(h, ID_E2_SPECIFIED))) + sc(28);
+    let bw = btn_w(h, ID_E2_BROWSE);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_E2_SPECIFIED), x, y + sc(2), rw, sc(22));
+    mv(ctl(h, ID_E2_OUTDIR), x + rw, y + sc(1), cw - rw - bw - sc(8), sc(24));
+    mv(ctl(h, ID_E2_BROWSE), x + cw - bw, y, bw, sc(BTN_H));
+    lay.gap(sc(6));
+    let y = lay.take(sc(20));
+    mv(ctl(h, 2021), x, y, cw, sc(20));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_PNG), x, y, cw, sc(22));
+    let y = lay.take(sc(24));
+    mv(ctl(h, ID_E2_JPG), x, y, cw, sc(22));
+    lay.gap(sc(6));
+    let aw = btn_w(h, ID_E2_ADV);
+    let y = lay.take(sc(30));
+    mv(ctl(h, ID_E2_ADV), x, y, aw, sc(BTN_H));
+    let lw = sc(96);
+    mv(ctl(h, ID_E2_STRENGTH), x + aw + sc(8), y, cw - aw - lw - sc(16), sc(BTN_H));
+    mv(ctl(h, ID_E2_STRENGTH_LABEL), x + cw - lw, y + sc(4), lw, sc(20));
+    foot_label(h, &mut lay, ID_E2_ERROR);
+    foot_label(h, &mut lay, ID_E2_NOTE_LAST);
+}
+
+unsafe extern "system" fn page_e2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_e2_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_e2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_e2(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_e2(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_e2(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(3);
+            let x = if st(h).map(|s| s.prefix_setup).unwrap_or(false) { 4 } else { 2 };
+            let sub = step_text(x, y, E2_SUBTITLE);
+            paint_banner(h, wp as HDC, E2_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_red(h, wp as HDC, lp as HWND),
+        WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_HSCROLL => {
+            if lp as HWND == ctl(h, ID_E2_STRENGTH) {
+                update_strength_label(h);
+            }
+            1
+        }
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_E2_SAME | ID_E2_SPECIFIED => {
+                    refresh_e2_enabled(h);
+                    1
+                }
+                ID_E2_BROWSE => {
+                    if let Some(d) = pick_folder(h, "选择输出文件夹") {
+                        set_text(ctl(h, ID_E2_OUTDIR), &d.display().to_string());
+                    }
+                    1
+                }
+                ID_E2_ADV => {
+                    let vis = IsWindowVisible(ctl(h, ID_E2_STRENGTH)) != 0;
+                    show(ctl(h, ID_E2_STRENGTH), !vis);
+                    show(ctl(h, ID_E2_STRENGTH_LABEL), !vis);
+                    set_text(ctl(h, ID_E2_ADV), if vis { "显示高级选项" } else { "隐藏高级选项" });
+                    relayout(h);
+                    redraw(h);
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_EMBED_OPTIONS;
+                    }
+                    set_submit_text_e2(h);
+                    set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
+                    0
+                }
+                PSN_KILLACTIVE => {
+                    restore_next(h);
+                    0
+                }
+                PSN_WIZNEXT => {
+                    let out_same = checked(ctl(h, ID_E2_SAME));
+                    let out_dir = get_text(ctl(h, ID_E2_OUTDIR)).trim().to_string();
+                    if !out_same && out_dir.is_empty() {
+                        set_msg(h, ID_E2_ERROR, "请选择输出文件夹。");
+                        return block_page(h);
+                    }
+                    if let Some(s) = st(h) {
+                        s.note = get_text(ctl(h, ID_E2_NOTE));
+                        s.out_same_dir = out_same;
+                        s.out_dir = out_dir;
+                        s.jpeg = checked(ctl(h, ID_E2_JPG));
+                        s.strength = e2_strength(h);
+                    }
+                    advance_to(h, PAGE_EMBED_PROGRESS)
+                }
+                PSN_WIZBACK => go_back(h),
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_e2(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ----- E3
+
+fn start_embed(h: HWND) {
+    let Some(s) = st(h) else { return };
+    if s.run.is_some() || !s.results.is_empty() {
+        return;
+    }
+    let Some(key) = s.ctx.key.clone() else { return };
+    let job = EmbedJob {
+        files: s.files.clone(),
+        out_dir: if s.out_same_dir { None } else { Some(PathBuf::from(&s.out_dir)) },
+        suffix: s.ctx.cfg.suffix.clone(),
+        strength: s.strength,
+        jpeg_quality: s.jpeg.then_some(s.ctx.cfg.jpeg_quality),
+        channel: if s.note.trim().is_empty() { None } else { Some(s.note.trim().to_string()) },
+    };
+    let regdir = s.registry_dir.clone();
+    let total = job.files.len();
+    let (tx, rx) = channel();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let cancel2 = cancel.clone();
+    std::thread::spawn(move || {
+        let mut send = |ev| {
+            let _ = tx.send(EmbedMsg::Event(ev));
+        };
+        let res = jobs::run_embed(&job, &key, &regdir, &cancel2, &mut send);
+        let _ = tx.send(EmbedMsg::Done(res));
+    });
+    s.run = Some(RunState { rx, cancel, total, done: 0 });
+    pb_set(ctl(h, ID_E3_PROGRESS), 0, total);
+    set_msg(h, ID_E3_STATUS, &format!("正在处理 0 / {total}…"));
+    unsafe { SetTimer(h, 2, 100, None) };
+}
+
+fn finish_embed(h: HWND, res: Result<EmbedSummary, UserError>) {
+    let Some(s) = st(h) else { return };
+    match res {
+        Ok(summary) => s.stopped = summary.cancelled,
+        Err(e) => {
+            let files = s.files.clone();
+            s.results = files.into_iter().map(|p| (p, Err(e.clone()))).collect();
+            s.stopped = false;
+        }
+    }
+    s.run = None;
+    set_buttons(h, PSWIZB_NEXT);
+    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_NEXT as WPARAM, 0) };
+}
+
+fn build_e3(h: HWND) {
+    create(PROGRESS_CLASSW, "", 0, 0, h, ID_E3_PROGRESS);
+    label_id(h, ID_E3_STATUS, "");
+}
+
+fn layout_e3(h: HWND) {
+    let mut lay = Lay::new(h);
+    lay.gap(sc(24));
+    let y = lay.take(sc(20));
+    mv(ctl(h, ID_E3_STATUS), lay.x, y, lay.w, sc(20));
+    lay.gap(sc(6));
+    let y = lay.take(sc(18));
+    mv(ctl(h, ID_E3_PROGRESS), lay.x, y, lay.w, sc(18));
+}
+
+unsafe extern "system" fn page_e3(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_e3_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_e3(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_e3(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_e3(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(3);
+            let x = if st(h).map(|s| s.prefix_setup).unwrap_or(false) { 5 } else { 3 };
+            let sub = step_text(x, y, "");
+            paint_banner(h, wp as HDC, E3_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_EMBED_PROGRESS;
+                        s.history.clear();
+                    }
+                    start_embed(h);
+                    set_buttons(h, PSWIZB_DISABLEDFINISH);
+                    0
+                }
+                PSN_QUERYCANCEL => {
+                    if st(h).and_then(|s| s.run.as_ref()).is_some() {
+                        let pressed = task_dialog(h, "要停止吗？已经处理好的图片会保留。", &[(1, "停止"), (2, "继续处理")]);
+                        if pressed == 1 {
+                            if let Some(run) = st(h).and_then(|s| s.run.as_ref()) {
+                                run.cancel.store(true, Ordering::SeqCst);
+                            }
+                        }
+                        return keep_open(h);
+                    }
+                    0
+                }
+                PSN_WIZBACK => block_page(h),
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 2 => {
+            let msgs: Vec<EmbedMsg> = st(h)
+                .and_then(|s| s.run.as_ref())
+                .map(|r| {
+                    let mut v = vec![];
+                    while let Ok(m) = r.rx.try_recv() {
+                        v.push(m);
+                    }
+                    v
+                })
+                .unwrap_or_default();
+            let mut finished = false;
+            for m in msgs {
+                match m {
+                    EmbedMsg::Event(EmbedEvent::Running { index }) => {
+                        if let Some(s) = st(h) {
+                            let name = s.files.get(index).map(|p| name_of(p)).unwrap_or_default();
+                            let done = s.results.len();
+                            let total = s.run.as_ref().map(|r| r.total).unwrap_or(0);
+                            set_msg(h, ID_E3_STATUS, &format!("正在处理 {name}（{done}/{total}）…"));
+                        }
+                    }
+                    EmbedMsg::Event(EmbedEvent::Item { index, result }) => {
+                        if let Some(s) = st(h) {
+                            let path = s.files.get(index).cloned().unwrap_or_default();
+                            s.results.push((path, result));
+                            if let Some(r) = s.run.as_mut() {
+                                r.done += 1;
+                                let (d, t) = (r.done, r.total);
+                                pb_set(ctl(h, ID_E3_PROGRESS), d, t);
+                            }
+                        }
+                    }
+                    EmbedMsg::Done(res) => {
+                        finished = true;
+                        finish_embed(h, res);
+                    }
+                }
+            }
+            if finished {
+                unsafe { KillTimer(h, 2) };
+            }
+            1
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_e3(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ----- E4
+
+fn e4_successes(s: &St) -> Vec<(u32, PathBuf)> {
+    s.results.iter().filter_map(|(_, r)| r.as_ref().ok().map(|ok| (ok.id, ok.output.clone()))).collect()
+}
+
+fn refresh_e4(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let lv = ctl(h, ID_E4_LIST);
+    lv_clear(lv);
+    for (p, r) in &s.results {
+        let name = name_of(p);
+        let text = match r {
+            Ok(ok) => format!("编号 0x{:08x}，保存为 {}", ok.id, name_of(&ok.output)),
+            Err(e) => e.message.clone(),
+        };
+        lv_add(lv, &[&name, &text], 0);
+    }
+    let any = e4_successes(s).is_empty();
+    enable(ctl(h, ID_E4_OPEN), !any);
+    enable(ctl(h, ID_E4_REG), !any);
+    let created = s.created_key_path.clone();
+    show(ctl(h, ID_E4_NEWKEY), created.is_some());
+    show(ctl(h, ID_E4_BACKUP), created.is_some());
+}
+
+fn build_e4(h: HWND) {
+    let lv = listview(h, ID_E4_LIST, false);
+    lv_column(lv, 0, "图片", sc(110), false);
+    lv_column(lv, 1, "结果", sc(340), false);
+    button(h, ID_E4_OPEN, "打开所在文件夹");
+    button(h, ID_E4_REG, "在登记表中查看");
+    button(h, ID_E4_TAB, "转到“加水印”选项卡");
+    label_id(h, ID_E4_HINT, E4_HINT);
+    label_id(h, ID_E4_NEWKEY, E4_NEWKEY);
+    button(h, ID_E4_BACKUP, "备份密钥…");
+    refresh_e4(h);
+}
+
+fn layout_e4(h: HWND) {
+    let mut lay = Lay::new(h);
+    foot_buttons(h, &mut lay, &[ID_E4_OPEN, ID_E4_REG, ID_E4_TAB]);
+    foot_label(h, &mut lay, ID_E4_HINT);
+    let nk = ctl(h, ID_E4_NEWKEY);
+    if unsafe { IsWindowVisible(nk) } != 0 {
+        let bw = btn_w(h, ID_E4_BACKUP);
+        let y = lay.foot(sc(BTN_H));
+        mv(nk, lay.x, y + sc(4), lay.w - bw - sc(8), sc(20));
+        mv(ctl(h, ID_E4_BACKUP), lay.x + lay.w - bw, y, bw, sc(BTN_H));
+        lay.foot(sc(ROW_GAP));
+    }
+    let lv = ctl(h, ID_E4_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lay.rest() - sc(4));
+    fit_columns(lv, &[30, 70]);
+}
+
+unsafe extern "system" fn page_e4(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_e4_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_e4_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_e4(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_e4(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_e4(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let (mut ok, mut failed) = (0usize, 0usize);
+            let mut stopped = false;
+            let mut total = 0usize;
+            if let Some(s) = st(h) {
+                // Every queued image counts, including the ones skipped by "停止".
+                total = s.files.len().max(s.results.len());
+                stopped = s.stopped;
+                for (_, r) in &s.results {
+                    if r.is_ok() { ok += 1; } else { failed += 1; }
+                }
+            }
+            let title = if stopped {
+                format!("已停止：完成 {ok} / {total} 张")
+            } else if failed > 0 {
+                format!("已完成 {ok} 张，{failed} 张没有处理")
+            } else {
+                format!("已为 {ok} 张图片加上水印")
+            };
+            paint_banner(h, wp as HDC, &title, "");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_E4_OPEN => {
+                    let dir = st(h).and_then(|s| e4_successes(s).first().and_then(|(_, p)| p.parent().map(|d| d.to_path_buf())));
+                    if let Some(d) = dir {
+                        shell_open(&d.display().to_string());
+                    }
+                    1
+                }
+                ID_E4_REG => {
+                    let ids: Vec<u32> = st(h).map(|s| e4_successes(s).into_iter().map(|(id, _)| id).collect()).unwrap_or_default();
+                    if let Some(s) = st(h) {
+                        s.outcome = WizardOutcome::ShowInRegistry(ids);
+                    }
+                    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_FINISH as WPARAM, 0) };
+                    1
+                }
+                ID_E4_TAB => {
+                    if let Some(s) = st(h) {
+                        s.outcome = WizardOutcome::ShowTab(0);
+                    }
+                    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_FINISH as WPARAM, 0) };
+                    1
+                }
+                ID_E4_BACKUP => {
+                    let key_path = st(h).map(|s| s.ctx.cfg.key_path.clone()).unwrap_or_default();
+                    let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
+                    if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
+                        match std::fs::copy(&key_path, &p) {
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
+                        }
+                    }
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_EMBED_DONE;
+                    }
+                    refresh_e4(h);
+                    set_buttons(h, PSWIZB_FINISH);
+                    0
+                }
+                PSN_WIZBACK => block_page(h),
+                PSN_WIZFINISH => 0,
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_e4(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ------------------------------------------------------------------ page 240..242: check
+
+fn check_name(item: &CheckItem) -> String {
+    match item {
+        CheckItem::File(p) => name_of(p),
+        CheckItem::Clip { label, .. } => label.clone(),
+    }
+}
+
+fn check_dims(item: &CheckItem) -> String {
+    match item {
+        CheckItem::File(p) => image::image_dimensions(p).map(|(w, h)| format!("{w} × {h}")).unwrap_or_else(|_| "—".into()),
+        CheckItem::Clip { img, .. } => format!("{} × {}", img.w, img.h),
+    }
+}
+
+fn check_where(item: &CheckItem) -> String {
+    match item {
+        CheckItem::File(p) => p.parent().map(|d| d.display().to_string()).unwrap_or_default(),
+        CheckItem::Clip { .. } => "剪贴板".into(),
+    }
+}
+
+fn add_check_files(s: &mut St, paths: Vec<PathBuf>) {
+    for p in paths {
+        if p.is_file() && !s.check_items.iter().any(|i| matches!(i, CheckItem::File(q) if *q == p)) {
+            s.check_items.push(CheckItem::File(p));
+        }
+    }
+}
+
+fn c1_paste(h: HWND) {
+    match clipboard_image(h) {
+        Some(ClipImage::Image(img)) => {
+            if let Some(s) = st(h) {
+                let n = s.check_items.iter().filter(|i| matches!(i, CheckItem::Clip { .. })).count() + 1;
+                s.check_items.push(CheckItem::Clip { label: format!("剪贴板截图 {n}"), img });
+            }
+            set_msg(h, ID_C1_ERROR, "");
+            refresh_c1(h);
+        }
+        Some(ClipImage::File(p)) => {
+            if let Some(s) = st(h) {
+                add_check_files(s, vec![p]);
+            }
+            set_msg(h, ID_C1_ERROR, "");
+            refresh_c1(h);
+        }
+        None => set_msg(h, ID_C1_ERROR, "剪贴板里没有图片。"),
+    }
+}
+
+fn build_c1(h: HWND) {
+    let lv = listview(h, ID_C1_LIST, false);
+    lv_column(lv, 0, "文件", sc(180), false);
+    lv_column(lv, 1, "尺寸", sc(80), false);
+    lv_column(lv, 2, "位置", sc(200), false);
+    button(h, ID_C1_ADD, "添加图片…");
+    button(h, ID_C1_FOLDER, "添加文件夹…");
+    button(h, ID_C1_REMOVE, "移除");
+    button(h, ID_C1_PASTE, "粘贴截图（Ctrl+V）");
+    label_id(h, ID_C1_EMPTY, E1_EMPTY);
+    label_id(h, ID_C1_ERROR, "");
+    label_id(h, ID_C1_NOTE, "");
+    unsafe { DragAcceptFiles(h, 1) };
+    refresh_c1(h);
+}
+
+fn refresh_c1(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let lv = ctl(h, ID_C1_LIST);
+    lv_clear(lv);
+    for (i, item) in s.check_items.iter().enumerate() {
+        lv_add(lv, &[&check_name(item), &check_dims(item), &check_where(item)], i as isize);
+    }
+    show(ctl(h, ID_C1_EMPTY), s.check_items.is_empty());
+}
+
+fn set_submit_text_c1(h: HWND) {
+    let label = commit_label(h, "开始检查");
+    set_msg(h, ID_C1_NOTE, &format!("点击“{label}”后开始检查。"));
+}
+
+fn layout_c1(h: HWND) {
+    let mut lay = Lay::new(h);
+    foot_label(h, &mut lay, ID_C1_ERROR);
+    foot_label(h, &mut lay, ID_C1_NOTE);
+    foot_buttons(h, &mut lay, &[ID_C1_ADD, ID_C1_FOLDER, ID_C1_REMOVE, ID_C1_PASTE]);
+    let lh = lay.rest() - sc(4);
+    let lv = ctl(h, ID_C1_LIST);
+    mv(lv, lay.x, lay.y, lay.w, lh);
+    fit_columns(lv, &[45, 20, 35]);
+    mv(ctl(h, ID_C1_EMPTY), lay.x + sc(16), lay.y + lh / 2 - sc(10), lay.w - sc(32), sc(20));
+}
+
+
+unsafe extern "system" fn page_c1(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_c1_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_c1_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_c1(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_c1(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_c1(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(2);
+            let x = if st(h).map(|s| s.prefix_setup).unwrap_or(false) { 3 } else { 1 };
+            let sub = step_text(x, y, E1_SUBTITLE);
+            paint_banner(h, wp as HDC, C1_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor_red(h, wp as HDC, lp as HWND),
+        WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_DROPFILES => {
+            let paths = dropped_files(wp as HDROP);
+            if let Some(s) = st(h) {
+                add_check_files(s, paths);
+            }
+            refresh_c1(h);
+            1
+        }
+        WM_KEYDOWN => {
+            if wp as u16 == VK_V && (GetKeyState(VK_CONTROL as i32) as i16) < 0 {
+                c1_paste(h);
+                return 1;
+            }
+            0
+        }
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_C1_ADD => {
+                    let paths = open_files(h, "添加要检查的图片", IMAGE_FILTER, true);
+                    if let Some(s) = st(h) {
+                        add_check_files(s, paths);
+                    }
+                    refresh_c1(h);
+                    1
+                }
+                ID_C1_FOLDER => {
+                    if let Some(d) = pick_folder(h, "选择包含图片的文件夹（不含子文件夹）") {
+                        if let Some(s) = st(h) {
+                            add_check_files(s, images_in(&d));
+                        }
+                        refresh_c1(h);
+                    }
+                    1
+                }
+                ID_C1_REMOVE => {
+                    let sel = lv_selected(ctl(h, ID_C1_LIST));
+                    if let Some(s) = st(h) {
+                        for i in sel.into_iter().rev() {
+                            if (i as usize) < s.check_items.len() {
+                                s.check_items.remove(i as usize);
+                            }
+                        }
+                    }
+                    refresh_c1(h);
+                    1
+                }
+                ID_C1_PASTE => {
+                    c1_paste(h);
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_CHECK_FILES;
+                    }
+                    refresh_c1(h);
+                    set_submit_text_c1(h);
+                    set_buttons(h, PSWIZB_BACK | PSWIZB_NEXT);
+                    0
+                }
+                PSN_KILLACTIVE => {
+                    restore_next(h);
+                    0
+                }
+                PSN_WIZNEXT => {
+                    if st(h).map(|s| s.check_items.is_empty()).unwrap_or(true) {
+                        set_msg(h, ID_C1_ERROR, "请至少添加一张图片。");
+                        return block_page(h);
+                    }
+                    advance_to(h, PAGE_CHECK_PROGRESS)
+                }
+                PSN_WIZBACK => go_back(h),
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_c1(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ---- C2
+
+fn start_check(h: HWND) {
+    let Some(s) = st(h) else { return };
+    if s.check_rx.is_some() || !s.check_results.is_empty() {
+        return;
+    }
+    let Some(key) = s.ctx.key.clone() else { return };
+    let items = s.check_items.clone();
+    let total = items.len();
+    let regdir = s.registry_dir.clone();
+    let opts = s.ctx.cfg.detect_options();
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        let mut note = None;
+        let ctx = match DetectContext::open(Some(&regdir), &key) {
+            Ok(c) => c,
+            Err(e) => {
+                note = Some(e);
+                DetectContext::open(None, &key).unwrap()
+            }
+        };
+        for (i, item) in items.iter().enumerate() {
+            let _ = tx.send(CheckMsg::Running { index: i });
+            let name = check_name(item);
+            let result = match item {
+                CheckItem::File(p) => match load_image(p) {
+                    Ok(img) => {
+                        let dr = ctx.detect(&img, &key, None, &opts);
+                        (name, Some(dr), None)
+                    }
+                    Err(e) => (
+                        name,
+                        None,
+                        Some(UserError {
+                            message: format!("无法打开 {}：文件可能已损坏，或者不是支持的图片格式。", name_of(p)),
+                            detail: format!("{e:#}"),
+                        }),
+                    ),
+                },
+                CheckItem::Clip { img, .. } => {
+                    let dr = ctx.detect(img, &key, None, &opts);
+                    (name, Some(dr), None)
+                }
+            };
+            let _ = tx.send(CheckMsg::Item { result });
+        }
+        let _ = tx.send(CheckMsg::Done { note });
+    });
+    s.check_rx = Some(rx);
+    s.check_total = total;
+    s.check_done = 0;
+    pb_set(ctl(h, ID_C2_PROGRESS), 0, total);
+    set_msg(h, ID_C2_STATUS, &format!("正在处理 0 / {total}…"));
+    unsafe { SetTimer(h, 3, 100, None) };
+}
+
+fn finish_check(h: HWND) {
+    if let Some(s) = st(h) {
+        s.check_rx = None;
+    }
+    set_buttons(h, PSWIZB_NEXT);
+    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_NEXT as WPARAM, 0) };
+}
+
+fn build_c2(h: HWND) {
+    create(PROGRESS_CLASSW, "", 0, 0, h, ID_C2_PROGRESS);
+    label_id(h, ID_C2_STATUS, "");
+}
+
+fn layout_c2(h: HWND) {
+    let mut lay = Lay::new(h);
+    lay.gap(sc(24));
+    let y = lay.take(sc(20));
+    mv(ctl(h, ID_C2_STATUS), lay.x, y, lay.w, sc(20));
+    lay.gap(sc(6));
+    let y = lay.take(sc(18));
+    mv(ctl(h, ID_C2_PROGRESS), lay.x, y, lay.w, sc(18));
+}
+
+unsafe extern "system" fn page_c2(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_c2_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_c2_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_c2(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_c2(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_c2(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let y = st(h).map(|s| step_y(s)).unwrap_or(2);
+            let x = if st(h).map(|s| s.prefix_setup).unwrap_or(false) { 4 } else { 2 };
+            let sub = step_text(x, y, "");
+            paint_banner(h, wp as HDC, C2_TITLE, &sub);
+            1
+        }
+        WM_CTLCOLORSTATIC => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_CHECK_PROGRESS;
+                        s.history.clear();
+                    }
+                    start_check(h);
+                    set_buttons(h, PSWIZB_DISABLEDFINISH);
+                    0
+                }
+                PSN_WIZBACK => block_page(h),
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 3 => {
+            let msgs: Vec<CheckMsg> = st(h)
+                .and_then(|s| s.check_rx.as_ref())
+                .map(|r| {
+                    let mut v = vec![];
+                    while let Ok(m) = r.try_recv() {
+                        v.push(m);
+                    }
+                    v
+                })
+                .unwrap_or_default();
+            let mut finished = false;
+            for m in msgs {
+                match m {
+                    CheckMsg::Running { index } => {
+                        if let Some(s) = st(h) {
+                            let name = s.check_items.get(index).map(check_name).unwrap_or_default();
+                            let done = s.check_results.len();
+                            let total = s.check_total;
+                            set_msg(h, ID_C2_STATUS, &format!("正在处理 {name}（{done}/{total}）…"));
+                        }
+                    }
+                    CheckMsg::Item { result } => {
+                        if let Some(s) = st(h) {
+                            s.check_results.push(result);
+                            s.check_done += 1;
+                            let (d, t) = (s.check_done, s.check_total);
+                            pb_set(ctl(h, ID_C2_PROGRESS), d, t);
+                        }
+                    }
+                    CheckMsg::Done { note } => {
+                        if let Some(s) = st(h) {
+                            s.check_note = note;
+                        }
+                        finished = true;
+                    }
+                }
+            }
+            if finished {
+                unsafe { KillTimer(h, 3) };
+                finish_check(h);
+            }
+            1
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_c2(h);
+            redraw(h);
+            1
+        }
+        _ => 0,
+    }
+}
+
+// ---- C3
+
+fn c3_kind(r: &Option<DetectResult>, err: &Option<UserError>) -> u8 {
+    if err.is_some() {
+        return 4;
+    }
+    let Some(dr) = r else { return 4 };
+    let rep = &dr.report;
+    if !rep.det.found {
+        return 3;
+    }
+    if rep.det.image_id.is_none() {
+        return 2;
+    }
+    if rep.content_similarity.map(|s| s < SIM_OK).unwrap_or(false) {
+        1
+    } else {
+        0
+    }
+}
+
+fn c3_short(r: &Option<DetectResult>, err: &Option<UserError>) -> String {
+    match c3_kind(r, err) {
+        0 => "是你的图片".into(),
+        1 => "找到了你的水印，但画面对不上".into(),
+        2 => "可能有你的水印，但图片损坏太严重".into(),
+        3 => "没有找到你的水印".into(),
+        _ => "图片打不开".into(),
+    }
+}
+
+fn c3_date(dr: &DetectResult) -> String {
+    dr.entry.as_ref().map(|e| e.registered_utc.chars().take(10).collect::<String>()).unwrap_or_default()
+}
+
+fn c3_full(name: &str, r: &Option<DetectResult>, err: &Option<UserError>) -> String {
+    match c3_kind(r, err) {
+        4 => match err {
+            Some(e) => format!("{name}：{}", e.message),
+            None => format!("{name}：图片打不开。"),
+        },
+        0 => {
+            let dr = r.as_ref().unwrap();
+            let id = dr.report.det.image_id.unwrap_or(0);
+            let channel = dr.entry.as_ref().and_then(|e| e.channel.clone()).unwrap_or_else(|| "（未填写）".into());
+            format!("{name}：是你的图片（编号 0x{id:08x}，备注“{channel}”，{} 登记）", c3_date(dr))
+        }
+        1 => {
+            let id = r.as_ref().and_then(|d| d.report.det.image_id).unwrap_or(0);
+            format!("{name}：找到了你的水印（编号 0x{id:08x}），但画面和登记的原图对不上，可能被大幅改动过，也可能是有人把水印移到了别的图上")
+        }
+        2 => format!("{name}：可能有你的水印，但图片损坏太严重，读不出编号"),
+        _ => format!("{name}：没有找到你的水印"),
+    }
+}
+
+fn c3_detail(name: &str, r: &Option<DetectResult>, err: &Option<UserError>) -> String {
+    let mut t = c3_full(name, r, err);
+    if let Some(dr) = r {
+        if let Some(id) = dr.report.det.image_id {
+            t += &format!("\r\n编号：0x{id:08x}");
+            if let Some(e) = &dr.entry {
+                t += &format!("\r\n备注：{}", e.channel.as_deref().unwrap_or("（未填写）"));
+                t += &format!("\r\n登记时间：{}", c3_date(dr));
+            }
+        }
+        if let Some(s) = dr.report.content_similarity {
+            t += &format!("\r\n画面相似度：{:.0}%", s * 100.0);
+        }
+    }
+    t
+}
+
+fn build_c3(h: HWND) {
+    let lv = listview(h, ID_C3_LIST, false);
+    lv_column(lv, 0, "图片", sc(100), false);
+    lv_column(lv, 1, "结论", sc(220), false);
+    edit_readonly_multi(h, ID_C3_DETAIL);
+    label_id(h, ID_C3_SUPP, C3_SUPP);
+    button(h, ID_C3_EXPORT, "导出检测报告…");
+    button(h, ID_C3_REG, "在登记表中查看");
+    button(h, ID_C3_TAB, "转到“检测”选项卡");
+    label_id(h, ID_C3_NEWKEY, E4_NEWKEY);
+    button(h, ID_C3_BACKUP, "备份密钥…");
+    label_id(h, 2030, C3_HINT);
+    refresh_c3(h);
+}
+
+fn refresh_c3(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let lv = ctl(h, ID_C3_LIST);
+    lv_clear(lv);
+    let mut notfound = false;
+    for (name, r, err) in &s.check_results {
+        let short = c3_short(r, err);
+        if short == "没有找到你的水印" {
+            notfound = true;
+        }
+        lv_add(lv, &[name, &short], 0);
+    }
+    show(ctl(h, ID_C3_SUPP), notfound);
+    let created = s.created_key_path.is_some();
+    show(ctl(h, ID_C3_NEWKEY), created);
+    show(ctl(h, ID_C3_BACKUP), created);
+    if let Some((name, r, err)) = s.check_results.first() {
+        set_text(ctl(h, ID_C3_DETAIL), &c3_detail(name, r, err));
+    } else {
+        set_text(ctl(h, ID_C3_DETAIL), "");
+    }
+}
+
+fn layout_c3(h: HWND) {
+    let mut lay = Lay::new(h);
+    foot_buttons(h, &mut lay, &[ID_C3_EXPORT, ID_C3_REG, ID_C3_TAB]);
+    foot_label(h, &mut lay, 2030);
+    let nk = ctl(h, ID_C3_NEWKEY);
+    if unsafe { IsWindowVisible(nk) } != 0 {
+        let bw = btn_w(h, ID_C3_BACKUP);
+        let y = lay.foot(sc(BTN_H));
+        mv(nk, lay.x, y + sc(4), lay.w - bw - sc(8), sc(20));
+        mv(ctl(h, ID_C3_BACKUP), lay.x + lay.w - bw, y, bw, sc(BTN_H));
+        lay.foot(sc(ROW_GAP));
+    }
+    foot_label(h, &mut lay, ID_C3_SUPP);
+    let rest = lay.rest() - sc(6);
+    let list_h = (rest * 45 / 100).max(sc(60));
+    let lv = ctl(h, ID_C3_LIST);
+    mv(lv, lay.x, lay.y, lay.w, list_h);
+    fit_columns(lv, &[35, 65]);
+    mv(ctl(h, ID_C3_DETAIL), lay.x, lay.y + list_h + sc(6), lay.w, rest - list_h - sc(6));
+}
+
+fn c3_export(h: HWND) {
+    let Some(s) = st(h) else { return };
+    let mut text = String::from("BlindMark 检测报告\n");
+    text += &format!("时间：{}\n", chrono::Local::now().format("%Y-%m-%d %H:%M:%S"));
+    let fp = s.ctx.key.as_deref().map(keys::fingerprint).unwrap_or_default();
+    text += &format!("密钥指纹：{fp}\n\n");
+    for (name, r, err) in &s.check_results {
+        text += &format!("{name}\n{}\n", c3_full(name, r, err));
+        if let Some(dr) = r {
+            if let Some(id) = dr.report.det.image_id {
+                text += &format!("编号：0x{id:08x}\n");
+            }
+            if let Some(e) = &dr.entry {
+                text += &format!("备注：{}\n", e.channel.as_deref().unwrap_or("（未填写）"));
+                text += &format!("登记时间：{}\n", c3_date(dr));
+            }
+            if let Some(sim) = dr.report.content_similarity {
+                text += &format!("画面相似度：{:.0}%\n", sim * 100.0);
+            }
+        }
+        text += "\n";
+    }
+    text += "技术详情\n";
+    for (name, r, _) in &s.check_results {
+        if let Some(dr) = r {
+            text += &format!("{name}\n{}\n", serde_json::to_string_pretty(&dr.report).unwrap_or_default());
+        }
+    }
+    let name = format!("blindmark-检测报告-{}.txt", chrono::Local::now().format("%Y%m%d-%H%M"));
+    if let Some(p) = save_file(h, "导出检测报告", "文本文件 (*.txt)\0*.txt\0", &name, "txt") {
+        let mut bytes = vec![0xEF, 0xBB, 0xBF];
+        bytes.extend_from_slice(text.as_bytes());
+        match std::fs::write(&p, bytes) {
+            Ok(()) => info(h, &format!("检测报告已保存到 {}", p.display())),
+            Err(e) => error(h, &format!("导出失败：{e:#}")),
+        }
+    }
+}
+
+unsafe extern "system" fn page_c3(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    guard(h, || page_c3_impl(h, msg, wp, lp))
+}
+
+unsafe fn page_c3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
+    match msg {
+        WM_INITDIALOG => {
+            init_state(h, lp);
+            build_c3(h);
+            set_font_tree(h, super::fonts().normal);
+            layout_c3(h);
+            redraw(h);
+            schedule_relayout(h);
+            1
+        }
+        WM_SIZE => {
+            layout_c3(h);
+            redraw(h);
+            1
+        }
+        WM_ERASEBKGND => {
+            let best = st(h).map(|s| s.check_results.iter().map(|(_, r, e)| c3_kind(r, e)).min().unwrap_or(3)).unwrap_or(3);
+            let title = match best {
+                0 => "这张图片是你的",
+                1 => "找到了你的水印，但画面对不上",
+                2 => "可能有你的水印，但读不出编号",
+                _ => "没有找到你的水印",
+            };
+            paint_banner(h, wp as HDC, title, "");
+            1
+        }
+        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => on_ctlcolor(h, wp as HDC, lp as HWND, 0),
+        WM_COMMAND => {
+            if ((wp >> 16) & 0xffff) as u32 != BN_CLICKED {
+                return 0;
+            }
+            match (wp & 0xffff) as u16 {
+                ID_C3_EXPORT => {
+                    c3_export(h);
+                    1
+                }
+                ID_C3_BACKUP => {
+                    let key_path = st(h).map(|s| s.ctx.cfg.key_path.clone()).unwrap_or_default();
+                    let name = format!("blindmark-key-backup-{}.key", chrono::Local::now().format("%Y%m%d"));
+                    if let Some(p) = save_file(h, "备份密钥", "密钥文件 (*.key)\0*.key\0所有文件 (*.*)\0*.*\0", &name, "key") {
+                        match std::fs::copy(&key_path, &p) {
+                            Ok(_) => info(h, &format!("密钥已备份到 {}。", p.display())),
+                            Err(e) => {
+                                eprintln!("{e:#}");
+                                error(h, "没能备份到这个位置，请换一个位置再试。");
+                            }
+                        }
+                    }
+                    1
+                }
+                ID_C3_REG => {
+                    let ids: Vec<u32> = st(h)
+                        .map(|s| {
+                            s.check_results
+                                .iter()
+                                .filter_map(|(_, r, _)| r.as_ref().and_then(|d| d.report.det.image_id.or(d.report.located_id)))
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if let Some(s) = st(h) {
+                        s.outcome = WizardOutcome::ShowInRegistry(ids);
+                    }
+                    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_FINISH as WPARAM, 0) };
+                    1
+                }
+                ID_C3_TAB => {
+                    if let Some(s) = st(h) {
+                        s.outcome = WizardOutcome::ShowTab(super::TAB_DETECT);
+                    }
+                    unsafe { PostMessageW(sheet(h), PSM_PRESSBUTTON, PSBTN_FINISH as WPARAM, 0) };
+                    1
+                }
+                _ => 0,
+            }
+        }
+        WM_NOTIFY => {
+            let nm = unsafe { &*(lp as *const NMHDR) };
+            if nm.idFrom as u16 == ID_C3_LIST && nm.code == LVN_ITEMCHANGED {
+                if let Some(&row) = lv_selected(ctl(h, ID_C3_LIST)).first() {
+                    if let Some((name, r, err)) = st(h).and_then(|s| s.check_results.get(row as usize).map(|(n, r, e)| (n.clone(), r, e))) {
+                        set_text(ctl(h, ID_C3_DETAIL), &c3_detail(&name, &r, &err));
+                    }
+                }
+                return 0;
+            }
+            match nm.code {
+                PSN_SETACTIVE => {
+                    capture_next(h);
+                    if let Some(s) = st(h) {
+                        s.cur = PAGE_CHECK_DONE;
+                    }
+                    refresh_c3(h);
+                    set_buttons(h, PSWIZB_FINISH);
+                    0
+                }
+                PSN_WIZBACK => block_page(h),
+                PSN_WIZFINISH => 0,
+                _ => 0,
+            }
+        }
+        WM_TIMER if wp == 0x7A => {
+            unsafe { KillTimer(h, 0x7A) };
+            layout_c3(h);
+            redraw(h);
             1
         }
         _ => 0,
@@ -635,10 +3077,8 @@ fn build_placeholder(h: HWND) {
 }
 
 fn layout_placeholder(h: HWND) {
-    let (w, ht) = client_size(h);
-    let x = content_x(w);
-    let cw = content_w(h);
-    mv(ctl(h, ID_PLACEHOLDER_BODY), x, 84, cw, (ht - 84 - sc(16)).max(sc(60)));
+    let lay = Lay::new(h);
+    mv(ctl(h, ID_PLACEHOLDER_BODY), lay.x, lay.y + sc(4), lay.w, lay.rest() - sc(4));
 }
 
 unsafe extern "system" fn page_placeholder(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
@@ -652,11 +3092,13 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
             build_placeholder(h);
             set_font_tree(h, super::fonts().normal);
             layout_placeholder(h);
+            redraw(h);
             schedule_relayout(h);
             1
         }
         WM_SIZE => {
             layout_placeholder(h);
+            redraw(h);
             1
         }
         WM_ERASEBKGND => {
@@ -668,6 +3110,7 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
             let nm = unsafe { &*(lp as *const NMHDR) };
             match nm.code {
                 PSN_SETACTIVE => {
+                    capture_next(h);
                     if let Some(s) = st(h) {
                         s.cur = PAGE_PLACEHOLDER;
                     }
@@ -687,6 +3130,7 @@ unsafe fn page_placeholder_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> is
         WM_TIMER if wp == 0x7A => {
             unsafe { KillTimer(h, 0x7A) };
             layout_placeholder(h);
+            redraw(h);
             1
         }
         _ => 0,
