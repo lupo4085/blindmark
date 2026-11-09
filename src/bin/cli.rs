@@ -42,9 +42,12 @@ enum Cmd {
         /// Do not create a folder per recipient; add the name to the file name instead.
         #[arg(long)]
         flat: bool,
-        /// Skip the RFC 3161 timestamp for this batch (on by default).
+        /// Request an RFC 3161 timestamp for this batch (off by default).
         #[arg(long)]
-        no_timestamp: bool,
+        timestamp: bool,
+        /// Time-stamp authority URL; only used together with --timestamp.
+        #[arg(long, default_value = blindmark::timestamp::DEFAULT_TSA)]
+        tsa: String,
     },
     /// Check images for your watermark
     Detect {
@@ -58,6 +61,11 @@ enum Cmd {
     Recipients {
         #[command(subcommand)]
         cmd: RecCmd,
+    },
+    /// Manage trusted timestamps of distribution batches
+    Stamp {
+        #[command(subcommand)]
+        cmd: StampCmd,
     },
 }
 
@@ -88,6 +96,23 @@ enum RecCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum StampCmd {
+    /// List batches and whether each timestamp was obtained
+    List {
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+    },
+    /// Request the timestamp again for an existing batch
+    Retry {
+        batch_id: String,
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+        #[arg(long, default_value = blindmark::timestamp::DEFAULT_TSA)]
+        tsa: String,
+    },
+}
+
 fn read_key(p: &PathBuf) -> Result<Vec<u8>> {
     keys::parse_key_file(&std::fs::read_to_string(p).with_context(|| format!("cannot read key {}", p.display()))?)
 }
@@ -109,7 +134,7 @@ fn main() -> Result<()> {
             }
             println!("wrote {} (fingerprint {}) — back it up, never share it", key.display(), keys::fingerprint(&k));
         }
-        Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat, no_timestamp } => {
+        Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat, timestamp, tsa } => {
             let k = read_key(&key)?;
             let mut reg = Registry::open(&registry)?;
             reg.check_key(&k)?;
@@ -130,15 +155,15 @@ fn main() -> Result<()> {
                     strength,
                     per_recipient_dir: !flat,
                     batch_id: Some(batch_id()),
-                    tsa: if no_timestamp { None } else { Some(blindmark::timestamp::DEFAULT_TSA.to_string()) },
+                    tsa: timestamp.then(|| tsa.clone()),
                 };
                 let batch = opts.batch_id.clone();
                 let res = distribute(&inputs, &targets, &k, &mut reg, &opts)?;
                 if let Some(st) = &res.stamp {
-                    if st.ok {
-                        eprintln!("timestamp ok: {} (digest {})", st.dir.display(), st.digest);
+                    if st.record.ok {
+                        eprintln!("timestamp ok: {} ({})", st.dir.display(), st.record.gen_time_utc.as_deref().unwrap_or(""));
                     } else {
-                        eprintln!("timestamp failed: {} — {}", st.dir.display(), st.error.as_deref().unwrap_or("unknown"));
+                        eprintln!("timestamp failed: {} — {}", st.dir.display(), stamp_error_kind(&st.record.error));
                     }
                 }
                 for c in res.copies {
@@ -214,6 +239,36 @@ fn main() -> Result<()> {
                 }
             }
         },
+        Cmd::Stamp { cmd } => match cmd {
+            StampCmd::List { registry } => {
+                for (batch, rec) in blindmark::timestamp::list_batches(&registry)? {
+                    match rec {
+                        Some(r) if r.ok => println!("{batch}\tok\t{}", r.gen_time_utc.as_deref().unwrap_or("")),
+                        Some(r) => println!("{batch}\t未获取\t{}", stamp_error_kind(&r.error)),
+                        None => println!("{batch}\t未获取"),
+                    }
+                }
+            }
+            StampCmd::Retry { batch_id, registry, tsa } => {
+                let st = blindmark::timestamp::retry_batch(&registry, &batch_id, &tsa)?;
+                if st.record.ok {
+                    println!("{batch_id}\tok\t{}", st.record.gen_time_utc.as_deref().unwrap_or(""));
+                } else {
+                    println!("{batch_id}\t未获取\t{}", stamp_error_kind(&st.record.error));
+                }
+            }
+        },
     }
     Ok(())
+}
+
+fn stamp_error_kind(error: &Option<blindmark::timestamp::StampError>) -> &'static str {
+    use blindmark::timestamp::StampError::*;
+    match error {
+        Some(Network { .. }) => "network",
+        Some(Rejected { .. }) => "rejected",
+        Some(Mismatch { .. }) => "mismatch",
+        Some(Malformed { .. }) => "malformed",
+        None => "-",
+    }
 }
