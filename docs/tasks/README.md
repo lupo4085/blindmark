@@ -11,10 +11,39 @@
 | W-3 | 加水印流程 E1–E4 | t-w-2（叠加） | 进行中 |
 | W-4 | 检查流程 C1–C3，删除旧向导 | t-w-3（叠加） | 进行中 |
 | W-4a | S2 卡死修复、文案定稿 | t-w-4（叠加） | 待做 |
-| A-fix / D-fix | alpha 分支的修复 | alpha（变基到 main 之后） | 卡未写 |
-| FMT | 整个仓库 cargo fmt，并加 rustfmt.toml | main（等 alpha 合并之后） | 卡未写 |
-| W-5 | 分发流程 D1–D5 | main（等 alpha 合并之后） | 卡未写 |
+| FMT | 整个仓库 cargo fmt，并加 rustfmt.toml | main（等 v0.3 发布之后） | 卡未写 |
 
 参考文档：
 - 规格：`docs/specs/wizard.md`、`docs/specs/ui-copy.md`
 - 规则：`AGENTS.md`、`docs/ARCHITECTURE.md`
+
+## v0.3（2026-11-09 起）
+
+**前提**：Lupo 在 Windows 上验收 `t-w-ui`（W-2 到 W-UI 的整条链）并合并进 main。下面所有卡都以合并后的 main 为起点。原来的 A-fix / D-fix 并入 V3-2 到 V3-4，原来的 W-5 由本节的 W-5 取代。
+
+| 卡号 | 标题 | 基线 | 依赖 | 状态 |
+|---|---|---|---|---|
+| V3-0 | 移植 alpha 的核心代码（不带界面） | main | t-w-ui 已合并 | 待做 |
+| V3-1 | 黄金样本和一键自检 `scripts/check` | main | V3-0 | 待做 |
+| V3-2 | 可信时间戳：严格校验、默认不联网、重试 | main | V3-1 | 待做 |
+| V3-3 | 接收人簿：增改查、归档、随机 ID | main | V3-2 | 待做 |
+| V3-4 | 分发核心：进度、停止、文件哈希、jobs 接口 | main | V3-3 | 待做 |
+| V3-5 | 密钥助记词（核心 + 命令行） | main | V3-1（可与 V3-2～4 并行） | 待做 |
+| V3-6 | 误报率标定：采集数据、出报告 | main | V3-1（可并行） | 待做 |
+| V3-6b | 根据标定结果调整阈值和 README 表述 | main | V3-6 跑完 | 等数据，Claude 写卡 |
+| W-5 | 向导分发流程 D1–D5、主窗口入口 | main | V3-4 | 待做 |
+| W-6 | 接收人管理、登记表和检测页显示接收人 | main | W-5 | 待做 |
+| W-7 | 助记词界面（显示、恢复、向导 S1/S3） | main | V3-5、W-5 | 待做 |
+| V3-R | 发布 0.3.0 | main | 以上全部 | Lupo + Claude |
+
+```
+t-w-ui 合并 → V3-0 → V3-1 ┬→ V3-2 → V3-3 → V3-4 → W-5 ┬→ W-6 ┐
+                          ├→ V3-5 ───────────────────────┴→ W-7 ┼→ V3-R
+                          └→ V3-6 → (跑一晚) → V3-6b ───────────┘
+```
+
+**V3-R 发布清单**（不发给 DeepSeek）：
+1. `scripts/check` 全绿；Lupo 在 Windows 上走完 wizard.md 第 6 节的走查，加上 W-5、W-6、W-7 的走查
+2. 在 V3-6 的负样本集上**零误报**；正样本识别率不低于 README 里现有数字
+3. Lupo 把 `Cargo.toml` 版本改成 `0.3.0`，Claude 更新 README（功能表、v0.3 新功能、误报率表述）和 `CHANGELOG.md`
+4. 打标签 `v0.3.0` 推送，CI 自动发布 Release

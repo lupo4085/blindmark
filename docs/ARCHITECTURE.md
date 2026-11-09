@@ -5,7 +5,7 @@
 |---|---|---|
 | `src/keys.rs` `src/wm.rs` `src/affine.rs` `src/features.rs` `src/imgproc.rs` | 水印格式 blindmark/v1 和检测算法 | 只能按 Claude 的设计卡改 |
 | `src/registry.rs` | 登记表：`registry.json` + `meta.json` + 缩略图 | 字段改动需要设计卡 |
-| `src/recipients.rs` `src/distribute.rs` `src/timestamp.rs` | 接收人簿、分发、时间戳（alpha 分支） | 按任务卡 |
+| `src/recipients.rs` `src/distribute.rs` `src/timestamp.rs` | 接收人簿、分发、时间戳（v0.3 从 alpha 移植，见 V3-0） | 按任务卡；文件格式改动需要设计卡 |
 | `src/jobs.rs`（W-0 新建） | **后台任务的唯一实现**：加水印、检测，以后再加分发 | 按任务卡 |
 | `src/lib.rs` | `embed_file`、`detect_image_opts`、`Report` | 按任务卡 |
 | `src/bin/cli.rs` | 命令行 | 按任务卡 |
@@ -25,3 +25,9 @@
 ## 窗口和线程
 - 后台线程通过 `PostMessage`、channel 加定时器把消息交回界面线程。界面控件只能在界面线程里操作。
 - 模态窗口关闭时，必须重新启用它的父窗口。对话框正在执行任务时不能直接销毁，必须先问用户，或者先停下任务。
+
+## v0.3 新增规则（2026-11-09）
+1. **联网**：整个程序只有 `timestamp::post_tsa` 一处联网。只有用户在这一批分发上**主动勾选**时间戳（命令行是 `--timestamp`），或者主动点“重试”时才会调用。默认值永远是不联网，也不记住上次的选择。
+2. **接收人名单** `recipients.json` 放在登记表文件夹里，只通过 `recipients::Book` 的方法读写。向导 D2 在界面线程里直接改名单（文件很小）；后台分发任务只在开始时读一次。登记表条目里的接收人姓名是**分发当时的快照**，以后改名不影响已有记录，检测结果显示快照。
+3. **助记词**：只在内存里出现。不写日志、不写任何文件、不进剪贴板。界面上显示助记词的控件不允许选中复制。
+4. **哈希**：登记表的 `sha256_file` 和时间戳清单的 `sha256_file`，都是写到磁盘以后的文件字节的 SHA-256，任何人拿到文件都能复核。`sha256_marked` 是像素哈希，含义不变。
