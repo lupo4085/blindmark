@@ -1,127 +1,298 @@
-# blindmark（Rust 版）
+<div align="center">
 
-带密钥、内容自适应、能扛截图和旋转的盲水印。Windows 上是原生 Win32 图形界面，macOS / Linux 用命令行。算法和 Python 参考实现（`python/` 目录）逐字节一致：同一把密钥、同一个登记表可以混用，两边加的水印都能互相检测。
+# BlindMark
 
-## 获取程序
+**Invisible, keyed watermarks that prove an image is yours — and show which copy leaked.**
 
-**方式一：用 GitHub 自动编译（推荐，不用装 Rust）**
-1. 把整个文件夹推到你自己的 GitHub 仓库，设成私有也可以。
-2. 打开仓库的 Actions 页面，选择 `build` → `Run workflow`，几分钟后在这次运行页面底部的 Artifacts 里下载。
-3. 想自动生成 Release：推一个版本标签，例如 `git tag v0.2.0 && git push origin v0.2.0`，编译好的程序会自动挂到 Releases 页面。
+Runs entirely offline · Collects no data · Your images never leave your computer
 
-Windows 包里有 `blindmark.exe`（图形界面）和 `blindmark-cli.exe`；macOS / Linux 包里只有 `blindmark-cli`。从 Artifacts 下载的 macOS / Linux 程序会丢失可执行权限，解压后先运行 `chmod +x blindmark-cli`。
+**English** | [简体中文](README.zh-CN.md)
 
-**方式二：自己编译**
-```bash
-# 先在 https://rustup.rs 安装 Rust
-cargo build --release
-# Windows：target\release\blindmark.exe（图形界面）和 blindmark-cli.exe
-# macOS / Linux：只用 target/release/blindmark-cli（图形界面只支持 Windows）
+[![build](https://github.com/lupo4085/blindmark/actions/workflows/build.yml/badge.svg)](https://github.com/lupo4085/blindmark/actions/workflows/build.yml)
+[![release](https://img.shields.io/github/v/release/lupo4085/blindmark?include_prereleases)](https://github.com/lupo4085/blindmark/releases)
+![platform](https://img.shields.io/badge/platform-Windows%20%7C%20macOS%20%7C%20Linux-blue)
+[![license](https://img.shields.io/badge/license-MIT%20%2F%20Apache--2.0-green)](#license)
+
+</div>
+
+![Original, watermarked, and difference amplified 20x](docs/images/demo-compare.png)
+
+<p align="center"><sub>Left: original. Middle: watermarked (PSNR 42.8 dB; no pixel changes by more than 6 luminance levels). Right: the difference, amplified 20×. The mark follows lines and texture and stays light on flat areas.</sub></p>
+
+> [!NOTE]
+> The user interface is currently in Chinese. An English UI is planned for v0.4. The command-line tool works in any language.
+
+---
+
+## Contents
+
+- [Why](#why)
+- [Features](#features)
+- [Live test: the image above](#live-test-the-image-above)
+- [Download and install](#download-and-install)
+- [Quick start](#quick-start)
+- [Desktop app (Windows)](#desktop-app-windows)
+- [Command line](#command-line)
+- [Benchmarks](#benchmarks)
+- [How it works](#how-it-works)
+- [Limitations](#limitations)
+- [Roadmap](#roadmap)
+- [Project layout](#project-layout)
+- [Contributing](#contributing)
+- [License](#license)
+
+## Why
+
+Artists, photographers and designers who share their work run into two problems: someone reposts an image and there is no easy way to show it is yours, or a draft sent to several people leaks and there is no way to tell who shared it.
+
+Visible watermarks spoil the picture and disappear with a crop. Online watermarking services need you to upload your originals. BlindMark takes a different approach:
+
+- It hides an **invisible ID** in the image that usually survives reposting, compression, screenshots and rotation.
+- **Only your key can read the ID.** Without the key, nobody can read or forge it.
+- Every ID goes into your own **registry**: which original, when, and who it was for.
+- Everything runs locally. **No network, no uploads.**
+
+## Features
+
+| Feature | Description |
+|---|---|
+| **Keyed blind watermark** | Detection needs only the key, not the original. One 32-bit ID per image, with a CRC check |
+| **Near-lossless** | Changes luminance only, with strength adapted to texture. Typical PSNR above 40 dB |
+| **Survives everyday handling** | JPEG / WebP compression, resizing, cropping, app UI frames, screenshots, any-angle rotation, mirroring |
+| **Screen photos (experimental)** | Reads photos taken of a screen after a perspective correction guided by the registry |
+| **Registry** | Records the original, note, time and thumbnail for each ID; searchable, exports to CSV |
+| **Catches transplanted marks** | After reading an ID, compares the picture with the registered thumbnail to spot a mark moved onto another image |
+| **One-click evidence export** | Report, SHA-256 of the suspect file, registered thumbnail and registry entry in one folder |
+| **Getting-started wizard** | Walks you through creating a key, choosing a registry, watermarking and checking. Press F1 any time |
+| **Native app** | Native Win32 UI on Windows (high-DPI aware); a single-binary CLI on all three platforms |
+| **Python reference implementation** | Byte-for-byte compatible with the Rust build, with attack simulations and benchmark scripts |
+
+**In development (v0.3):** per-recipient distribution (a separately numbered copy for each recipient) and optional trusted timestamps (off by default; only goes online when you turn it on). Currently on the `alpha` branch.
+
+## Live test: the image above
+
+This illustration is only 441×512 pixels, much smaller than the photos in the benchmark set, which makes it a hard case for a blind watermark.
+
+```console
+$ blindmark-cli keygen --key demo.key
+wrote demo.key (fingerprint a65eb21f65bd) — back it up, never share it
+
+$ blindmark-cli embed lupo.png --out marked --key demo.key --registry reg --channel "README demo"
+{"id":"0xe308fb2a","input":"lupo.png","output":"marked/lupo_wm.png","psnr_db":42.84,"sec":0.025}
+
+$ blindmark-cli detect marked/lupo_wm.png --key demo.key --registry reg
+{"found":true,"id_hex":"0xe308fb2a","method":"crc","z_sync":34.9,"content_similarity":0.99996, ...}
+
+$ blindmark-cli detect lupo.png --key demo.key --registry reg      # original, no watermark
+{"found":false,"present":false, ...}
 ```
 
-Windows 首次运行未签名程序时 SmartScreen 可能拦截：点“更多信息”→“仍要运行”。macOS 会拦截未签名的命令行程序：运行 `xattr -d com.apple.quarantine blindmark-cli`。
+We then applied the same attacks to both the watermarked image and the **unwatermarked original**, five random runs each:
 
-## 图形界面（Windows）
+![The ID is still read after compression, cropping, rotation and a screen photo](docs/images/demo-attacks.png)
 
-经典 Win32 窗口：菜单栏、四个选项卡、底部状态栏（当前状态 · 密钥指纹 · 登记表条数 · 版本）。支持高 DPI 和多显示器缩放，所有设置保存在 `%APPDATA%\blindmark\settings.json`。第一次启动时会提示新建密钥，默认保存在 `%APPDATA%\blindmark\blindmark.key`，登记表在同目录的 `registry\`。
+| Attack | Correct ID | Wrong ID | False positives on original |
+|---|---|---|---|
+| None | 5/5 | 0 | 0/5 |
+| JPEG quality 75 / 50 | 5/5 / 5/5 | 0 | 0/10 |
+| WebP quality 70 | 5/5 | 0 | 0/5 |
+| Resize 0.5× / 0.75× / 1.5× | 5/5 / 5/5 / 5/5 | 0 | 0/15 |
+| Crop to 50% / 25% of the area | 5/5 / 5/5 | 0 | 0/10 |
+| App UI frame, gamma | 5/5 / 5/5 | 0 | 0/10 |
+| Any-angle rotation (±30°) + JPEG 85 | 5/5 | 0 | 0/5 |
+| Mirror, then screenshot | 5/5 | 0 | 0/5 |
+| Screenshot, mild | 5/5 | 0 | 0/5 |
+| Screenshot, typical (45–100% zoom, 40–90% captured, JPEG 65–90) | 1/5 | 0 | 0/5 |
+| Screenshot, harsh (35–60% zoom, 30–60% captured, JPEG 55–75) | 0/5 | 0 | 0/5 |
+| Simulated photo of a screen | 5/5 | 0 | 0/5 |
 
-| 选项卡 | 作用 |
+**Result:** 15 of 17 attacks were read every time. **Across all 85 tests on the original there were no false positives, and no run ever returned a wrong ID.** The screenshot failures come from the image's small size: shrunk to about 200 pixels, each tile is only about 50 pixels across, which carries too little signal. Larger images do much better on screenshots (see [Benchmarks](#benchmarks)).
+
+The original and watermarked test images are in [`docs/images/`](docs/images/). To reproduce, build the CLI and run the commands above; the attacks are in [`python/attacks.py`](python/attacks.py) and [`python/photo_sim.py`](python/photo_sim.py).
+
+## Download and install
+
+### Prebuilt binaries (recommended)
+
+Download the archive for your platform from [Releases](https://github.com/lupo4085/blindmark/releases):
+
+| Platform | Contents |
 |---|---|
-| 加水印 | 添加图片或文件夹（也可以直接拖进窗口），设置输出文件夹、渠道备注（比如“微博”“发给某客户”，会记住用过的）、强度、PNG / JPEG。批量处理在后台进行，可以随时取消，每张图的编号和 PSNR 显示在列表里 |
-| 检测 | 打开、拖入，或者直接 **Ctrl+V 粘贴截图**。上方横幅给出结论，表格列出编号、渠道、原始文件、登记时间、画面相似度、同步强度、检测方式和耗时，右侧显示登记时的缩略图。可以复制文字报告，或“导出证据…”：把报告、可疑文件（附 SHA-256）、登记缩略图和登记记录一起存进一个文件夹 |
-| 登记表 | 按编号、文件名、渠道搜索和筛选，点列标题排序。右侧显示缩略图、尺寸、强度、输出位置和哈希，可以修改渠道、打开输出位置、导出 CSV |
-| 设置 | 密钥（新建 / 选择 / 备份）、登记表（换文件夹 / 备份 / 导出 CSV）、加水印默认值（强度、格式、JPEG 质量、输出文件夹、文件名后缀）、检测选项（仿射同步、拍屏校正、画面比对、标准 / 严格判定、线程数）、常规（启动页、记住窗口、自动读取剪贴板） |
+| Windows | `blindmark.exe` (desktop app), `blindmark-cli.exe` (command line) |
+| macOS / Linux | `blindmark-cli` (command line) |
 
-“帮助 → 关于”显示版本、构建信息、当前密钥指纹和许可证；“许可证…”窗口里可以查看 MIT、Apache-2.0 全文和全部第三方组件的许可证列表。
+The binaries are not code-signed yet:
 
-常用快捷键：Ctrl+O 添加图片，Ctrl+D 检测图片，Ctrl+V 从剪贴板检测，Del 移除所选，F5 刷新登记表，Ctrl+1…4 切换选项卡。
+- **Windows:** if SmartScreen blocks it, click "More info" → "Run anyway".
+- **macOS:** run `xattr -d com.apple.quarantine blindmark-cli`.
+- **macOS / Linux:** files downloaded from Actions artifacts lose the executable bit; run `chmod +x blindmark-cli` first.
 
-检测结果分五种：
-- ✔ **找到你的水印**：编号和画面都对得上。
-- ⚠ **编号对上了，但画面不一致**：可能有人把你的水印搬到了另一张图上。
-- ⚠ **检测到水印，但无法确定是哪张**：截得太小或压缩太狠。
-- ⚠ **画面与你登记的图片一致，但没有读出水印**：可能拍得太糊、太斜，或者流出的是没加水印的原图。
-- ✕ **未检测到**：这不能证明图不是你的。
+### Build from source
 
-## 命令行（全部平台）
+Requires [Rust](https://rustup.rs) (2024 edition).
+
+```bash
+git clone https://github.com/lupo4085/blindmark.git
+cd blindmark
+cargo build --release
+# Windows: target\release\blindmark.exe and blindmark-cli.exe
+# macOS / Linux: target/release/blindmark-cli
+```
+
+You can also fork the repo and run the `build` workflow from the Actions tab; binaries for all three platforms appear under Artifacts a few minutes later. Pushing a version tag (e.g. `v0.3.0`) publishes a Release automatically.
+
+## Quick start
+
+**Windows desktop app**
+
+1. Open `blindmark.exe`. On first launch a wizard walks you through: create a key → choose where to keep the registry → **back up your key**.
+2. Choose "给图片加水印" (Watermark images), drop your pictures in and start. Watermarked copies are saved next to the originals by default.
+3. When you find a suspicious copy online, open the 检测 (Detect) tab and **paste a screenshot with Ctrl+V**, or drop the file in.
+
+**Command line**
 
 ```bash
 blindmark-cli keygen --key my.key
-blindmark-cli embed photos/*.jpg --out marked/ --key my.key --registry reg/ --channel "微博"
-blindmark-cli detect suspect.jpg --key my.key --registry reg/      # 每张图输出一行 JSON
+blindmark-cli embed photos/*.jpg --out marked/ --key my.key --registry reg/ --channel "Instagram"
+blindmark-cli detect suspect.jpg --key my.key --registry reg/
 ```
 
-## 测试结果
+> [!IMPORTANT]
+> **Back up your key file and your registry folder.** If you lose the key, you can never read your existing watermarks again. Never share the key with anyone.
 
-以下是 9 张测试图上的模拟测试，样本量不大，只作参考。
+## Desktop app (Windows)
 
-**常规处理**（每种随机攻击跑 4 次）
+A classic Win32 window with a menu bar, four tabs and a status bar (status · key fingerprint · registry size · version). High-DPI and per-monitor scaling are supported. Settings live in `%APPDATA%\blindmark\settings.json`; the key defaults to `%APPDATA%\blindmark\blindmark.key` and the registry to `registry\` in the same folder.
 
-| 攻击 | 识别率 | 认错 ID | 未加水印图误报 |
+| Tab | What it does |
+|---|---|
+| **Watermark** | Add images or folders (or drag them onto the window); choose the output folder, a note (e.g. "Weibo", "for client X"; recent notes are remembered), strength and PNG / JPEG. Batches run in the background and can be stopped at any time |
+| **Detect** | Open, drop, or **paste a screenshot with Ctrl+V**. A banner gives the verdict; a table lists ID, note, original file, registration time and picture similarity, with the registered thumbnail alongside. Copy a text report or export evidence |
+| **Registry** | Search and filter by ID, file name or note; sort by column; edit notes, open the output location, export CSV |
+| **Settings** | Key (new / choose / back up / remove), registry, watermark defaults, detection options, general options |
+
+**Five possible verdicts:**
+
+| Verdict | Meaning |
+|---|---|
+| Your watermark was found | Both the ID and the picture match |
+| ID matches, picture does not | Someone may have moved your watermark onto another image |
+| Watermark present, ID unreadable | Cropped too small or compressed too hard |
+| Picture matches, no watermark read | Photo too blurry or skewed, or the unwatermarked original leaked |
+| No watermark found | This does **not** prove the image isn't yours |
+
+**Shortcuts:** F1 getting started (wizard), Ctrl+O add images, Ctrl+D detect, Ctrl+V detect from clipboard, Del remove selected, F5 refresh registry, Ctrl+1…4 switch tabs.
+
+## Command line
+
+```text
+blindmark-cli keygen --key <keyfile>
+blindmark-cli embed  <images...> --out <dir> --key <keyfile> [--registry <dir>]
+                     [--strength 2.6] [--channel <note>] [--jpeg]
+blindmark-cli detect <images...> --key <keyfile> [--registry <dir>]
+```
+
+`embed` and `detect` print one JSON line per image, so they are easy to script. Key fields in detection output:
+
+| Field | Meaning |
+|---|---|
+| `found` | A definite ID was read |
+| `id_hex` | The ID |
+| `present` | Signs of a watermark were found (the ID may still be unreadable) |
+| `method` | `crc`: decoded directly; `registry`: maximum-likelihood match against registered IDs |
+| `content_similarity` | Picture match against the registered thumbnail, 0–1, threshold 0.6 |
+| `z_sync` | Sync signal strength |
+
+## Benchmarks
+
+Simulated tests on 9 photos. The sample is small; treat the numbers as indicative.
+
+**Everyday handling** (4 random runs per attack)
+
+| Attack | Detection rate | Wrong ID | False positives |
 |---|---|---|---|
-| JPEG q50/q75、WebP q70、缩放 0.5/0.75/1.5、伽马、加 UI 边框 | 100% | 0 | 0 |
-| 裁剪保留 50% / 25% | 97% / 89% | 0 | 0 |
-| 截图·轻度 / 常见 | 97% / 100% | 0 | 0 |
-| 截图·严苛（缩到 0.35–0.6、只截 30–60%、JPEG 55–75） | 33% | 0 | 0 |
+| JPEG q50/q75, WebP q70, resize 0.5/0.75/1.5, gamma, UI frame | 100% | 0 | 0 |
+| Crop to 50% / 25% | 97% / 89% | 0 | 0 |
+| Screenshot, mild / typical | 97% / 100% | 0 | 0 |
+| Screenshot, harsh | 33% | 0 | 0 |
 
-**旋转和翻转**（v0.2 新增，每种跑 3 次）
+**Rotation and mirroring** (3 runs per attack)
 
-| 攻击 | 识别率 | 认错 ID | 未加水印图误报 |
+| Attack | Detection rate | Wrong ID | False positives |
 |---|---|---|---|
-| 任意角度旋转 + JPEG 85 | 89% | 0 | 0 |
-| 缩放、截取一部分、加边框，再旋转 ±20°，JPEG 80 | 82% | 0 | 0 |
-| 左右镜像后再截图 | 93% | 0 | 0 |
+| Any-angle rotation + JPEG 85 | 89% | 0 | 0 |
+| Resize, partial capture, frame, rotate ±20°, JPEG 80 | 82% | 0 | 0 |
+| Mirror, then screenshot | 93% | 0 | 0 |
 
-**画面一致性检查**：正常检出的图（包括截图、旋转、镜像）在 0.78 以上，中位数 0.99；把水印移植到别的图上，结果在 0.01 以下。判定阈值是 0.6。
+- **Picture consistency:** genuine detections score above 0.78 (median 0.99); a watermark transplanted onto another image scores below 0.01.
+- **Screen photos (experimental):** spot checks only. Simulated photos tilted 20° and 30° are read; photos taken from too far away are not.
+- **Speed:** about 1.5 s to watermark a 24-megapixel photo; 1–2 s to detect, 3–4 s when rotation correction is needed (dual-core machine).
 
-**对着屏幕拍照（实验性）**：只做了抽查，没有完整评测。借助登记表做透视校正后，倾斜 20°、30° 和镜头歪斜的模拟拍屏都能读出编号；拍得太远、太小时仍然读不出来。
+## How it works
 
-**速度**：一张 2400 万像素的照片，加水印约 1.5 秒。没有旋转的图检测 1–2 秒；需要走旋转校正时，在双核机器上约 3–4 秒，普通多核电脑会快很多。
-
-## 原理
-
-1. 由私钥生成 64×64 的 ±1 码片网格：一半是同步码，另一半承载载荷。载荷是 32 位编号加 CRC-16，用 Feistel 加密。
-2. 码片网格平铺到全图，周期约为短边的 1/4，只改亮度通道，嵌入强度跟随纹理和亮度变化。
-3. 检测时：用白化和未白化的自相关估计平铺周期（也就得到了缩放比例），把各个周期折叠成一块，和同步码做相关来对齐，然后先直接解码（CRC 校验），失败时再在登记过的编号里做最大似然匹配。
-4. **旋转和翻转（仿射同步）**：如果上一步没认出来，就在白化自相关图里找二维点阵。平铺的水印在任何旋转、缩放、拉伸下仍然是点阵，点阵的两个基向量就给出了变换。候选点阵来自三种方法（只看坐标轴的周期、按角度和周期穷举的点阵匹配滤波、强峰两两组合），再把每个候选还原成正方形后折叠，方形块的 8 种对称姿态（旋转 90° 的倍数和镜像）都试一遍，取同步分数最高的。这一步只改检测端，旧版加的水印同样适用。
-5. **对着屏幕拍照（借助登记表）**：如果仍然认不出来，就用特征点（自实现的 ORB）把照片和登记表里每张缩略图做匹配，用 RANSAC 估计透视变换，把照片拉正后再读水印。这一步需要登记表，但不需要原图。
-6. 画面一致性：用检测得到的缩放和旋转加相位相关，把可疑图对齐到登记的缩略图上，跳过平坦区域，取各分块相关系数的中位数。
-
-## 局限
-
-- 平铺带来的周期结构，没有密钥也能被发现，别人可以在单张图内把各块叠加平均来估计并去除水印。
-- 不抗 AI 重绘。
-- 拍屏检测是实验性的，并且依赖登记表；拍得太远、太糊时读不出来。
-- 很暗、大片纯色的图片在同时被拉伸或错切时容易失败（只旋转、镜像没问题）。
-- 旋转和拍屏的识别逻辑目前只在 Rust 版里完整实现。Python 参考版有旋转同步（`python/affine.py`），但没有拍屏校正。
-- 主张所有权时，要同时保留原图、登记表（最好对登记表做可信时间戳）和检测结果。
-- **一定要备份私钥和登记表文件夹。** 丢了私钥就再也检测不出自己的水印。
-
-## 目录
-
-```
-src/keys.rs       密钥派生、码片图样、载荷加密（与 Python 逐字节一致，有测试向量）
-src/imgproc.rs    滤波、缩放、FFT（边界和插值方式与 OpenCV 一致）
-src/wm.rs         嵌入与常规检测
-src/affine.rs     旋转、翻转、拉伸的仿射同步
-src/features.rs   ORB 特征点、匹配与 RANSAC 透视估计（拍屏校正用）
-src/registry.rs   登记表（JSON，与 Python 版兼容）、图片读写、画面一致性检查
-src/main.rs       程序入口（非 Windows 上提示改用命令行）
-src/win/          Win32 图形界面：主窗口、四个选项卡、关于与许可证窗口
-assets/           图标、应用清单（高 DPI、通用控件 v6）、版本资源模板
-build.rs          生成第三方许可证列表，Windows 上嵌入图标和版本信息
-src/bin/cli.rs    命令行
-python/           Python 参考实现、仿射同步原型、截图与拍屏模拟、评测脚本
-.github/workflows 三平台自动编译
+```mermaid
+flowchart LR
+    K[Secret key] --> P[64×64 chip pattern<br/>half sync, half payload]
+    ID[32-bit ID + CRC-16] -->|Feistel encryption| P
+    P -->|tiled across the image<br/>luminance only, texture-adaptive| W[Watermarked image]
+    W --> R[(Registry<br/>ID · thumbnail · note)]
 ```
 
-## 许可证
+1. **Embedding:** the key generates a 64×64 grid of ±1 chips, half sync code and half payload (32-bit ID + CRC-16, Feistel-encrypted). The grid is tiled across the image with a period of about a quarter of the short side.
+2. **Detection:** autocorrelation gives the tile period (and so the scale); all tiles are folded into one and aligned by correlating with the sync code, then decoded. If the CRC fails, the detector does a maximum-likelihood match against registered IDs.
+3. **Affine sync:** a tiled watermark stays a 2-D lattice under rotation, scaling and shear. Finding the lattice's two basis vectors in the whitened autocorrelation gives the transform; all 8 symmetries of the square tile are then tried.
+4. **Screen-photo correction:** ORB features match the photo against registry thumbnails, RANSAC estimates the perspective, and the photo is rectified before reading. Needs the registry, but not the original.
+5. **Picture consistency:** the suspect image is aligned to the registered thumbnail; flat regions are skipped and the median block correlation is taken.
 
-本项目采用 **MIT 或 Apache-2.0 双许可**，使用者可以任选其一：
+The `blindmark/v1` format is frozen: every future version will read watermarks made today.
 
-- [MIT License](LICENSE-MIT)
-- [Apache License 2.0](LICENSE-APACHE)
+## Limitations
 
-除非你明确声明，否则你有意提交给本项目的任何贡献，按 Apache-2.0 的定义，都将以上述双许可发布，不附加任何其他条款或条件。
+- The periodic structure from tiling can be found without the key; a determined attacker can average the tiles within one image to estimate and remove the mark.
+- Does not survive AI redraws or style transfer.
+- Small images shrunk heavily cannot be read (see the live test above).
+- Screen-photo detection is experimental and depends on the registry.
+- Very dark images with large flat areas can fail when also stretched or sheared.
+- A watermark is one piece of evidence, not all of it. To claim ownership, keep the original, the registry and the detection results.
 
-本项目使用的第三方 Rust 库均为 MIT、Apache-2.0 等宽松许可证，各自的许可证文本随源码包分发。
+## Roadmap
+
+- [x] v0.2: Win32 desktop app, affine sync (rotation / mirroring), screen-photo correction
+- [x] v0.3-alpha: getting-started wizard, shared `jobs.rs` logic
+- [ ] v0.3: per-recipient distribution, optional trusted timestamps, mnemonic key backup, calibrated false-positive rate
+- [ ] v0.4: English UI, web detector (WASM; images never uploaded), winget / Scoop
+- [ ] v0.5: optional neural detection boost (ONNX, CPU only)
+
+## Project layout
+
+```text
+src/keys.rs       key derivation, chip patterns, payload encryption (byte-identical to Python)
+src/wm.rs         embedding and standard detection
+src/affine.rs     affine sync for rotation, mirroring and shear
+src/features.rs   ORB features and RANSAC perspective (screen photos)
+src/registry.rs   registry, image I/O, picture consistency check
+src/jobs.rs       background watermark and detect jobs (shared by app and wizard)
+src/imgproc.rs    filtering, resizing, FFT
+src/win/          Win32 desktop app and wizard
+src/bin/cli.rs    command line
+python/           Python reference implementation, attack simulations, benchmarks
+docs/             architecture, UI specs, task cards
+```
+
+## Contributing
+
+Issues and pull requests are welcome. Before you start, please read:
+
+- [`AGENTS.md`](AGENTS.md): ground rules (no watermark format changes, no new network access, no casual new dependencies)
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): module responsibilities and state ownership
+- [`docs/specs/`](docs/specs/): UI and copy specifications
+
+Please run `cargo fmt`, `cargo clippy` and `cargo test` before submitting.
+
+## License
+
+The code is dual-licensed under **MIT or Apache-2.0**, at your option: [MIT](LICENSE-MIT) · [Apache-2.0](LICENSE-APACHE).
+
+Unless you explicitly state otherwise, any contribution you intentionally submit to this project is dual-licensed as above, without any additional terms or conditions.
+
+The demo illustration in `docs/images/` is © 洛凌寒 (Rasen), used for demonstration only, and is not covered by the code license above.
