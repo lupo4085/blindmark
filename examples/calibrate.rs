@@ -7,7 +7,7 @@
 //!
 //! ```text
 //! cargo run --release --example calibrate -- --images <DIR> --out calib.csv \
-//!     [--keys 10] [--registry-size 1000] [--resume] [--images-limit N]
+//!     [--keys 10] [--registry-size 1000] [--resume] [--images-limit N] [--jobs N]
 //! ```
 //!
 //! `--images` is searched recursively. Each top-level sub folder is a category
@@ -17,18 +17,25 @@
 //! quick trial runs. Positive samples are the first 40 images, taken round-robin from the
 //! categories.
 //!
-//! Output rows are appended and flushed one by one; `--resume` skips rows already present
-//! (keyed by kind, image, variant, key_index).
+//! Detection tasks (image x variant x key) run on a fixed rayon pool of `--jobs` threads;
+//! each detection keeps its internal rayon parallelism. The CSV is behind a mutex and every
+//! row is flushed. Row order depends on scheduling, so `--resume` de-duplicates by
+//! (kind, image, variant, key_index) and never depends on row order.
+//!
+//! Output rows are appended and flushed one by one; `--resume` skips rows already present.
 
 use anyhow::{Context, Result};
 use blindmark::imgproc::{self, Plane};
 use blindmark::registry::{from_dynamic, load_image, RgbImageBuf};
 use blindmark::wm::{self, KnownIds};
 use clap::Parser;
+use rayon::prelude::*;
 use std::collections::BTreeMap;
 use std::collections::HashSet;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"];
@@ -58,10 +65,20 @@ struct Args {
     /// Only process the first N images after sorting by path (trial runs).
     #[arg(long)]
     images_limit: Option<usize>,
+    /// Number of detection tasks running at once (default: half the logical CPUs).
+    #[arg(long)]
+    jobs: Option<usize>,
+}
+
+fn default_jobs() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(1))
+        .unwrap_or(1)
 }
 
 fn main() -> Result<()> {
     let a = Args::parse();
+    let jobs = a.jobs.unwrap_or_else(default_jobs).max(1);
     let mut images = collect_images(&a.images)?;
     images.sort_by(|x, y| rel_string(&a.images, x).cmp(&rel_string(&a.images, y)));
     if let Some(n) = a.images_limit {
@@ -72,163 +89,317 @@ fn main() -> Result<()> {
     }
 
     let keys = generate_keys(a.keys);
-    let known: Vec<KnownIds> = keys
+    let known: Vec<Arc<KnownIds>> = keys
         .iter()
         .enumerate()
-        .map(|(i, k)| KnownIds::new(k, registry_ids(i, a.registry_size)))
+        .map(|(i, k)| Arc::new(KnownIds::new(k, registry_ids(i, a.registry_size))))
         .collect();
     let positives = pick_positives(&a.images, &images, POSITIVES);
+    let pkeys: Vec<([u8; 32], Arc<KnownIds>)> = (0..positives.len())
+        .map(|pi| {
+            let (k, _) = positive_key_and_id(pi);
+            (k, Arc::new(KnownIds::new(&k, registry_ids(1000 + pi, a.registry_size))))
+        })
+        .collect();
+    let synthetics = synthetic_images();
 
-    let total_rows = images.len() * 3 * a.keys + 30 * 3 * a.keys + positives.len() * 4;
+    let total_rows = images.len() * 3 * a.keys + synthetics.len() * 3 * a.keys + positives.len() * 4;
     let done_set = if a.resume { read_done(&a.out)? } else { HashSet::new() };
-    let done_rows = done_set.len();
-    let mut out = OutCsv::open(&a.out, !a.resume || !a.out.exists())?;
-    let mut stats = Stats { written: 0, skipped: 0, panics: 0, total: total_rows, start: Instant::now() };
+    let out = OutCsv::open(&a.out, !a.resume || !a.out.exists())?;
 
-    // ---------------------------------------------------------------- negatives
-    for img in &images {
-        let rel = rel_string(&a.images, img);
-        let category = category_of(&rel);
-        let base = downscale(load_image(img).with_context(|| format!("load {}", rel))?);
-        let variants = negative_variants(&base)?;
-        for (variant, rgb) in &variants {
-            for (ki, key) in keys.iter().enumerate() {
-                process(&mut out, &done_set, &mut stats, "neg", &rel, &category, variant, ki, rgb, key, &known[ki])?;
-            }
-        }
-    }
+    let ctx = TaskCtx {
+        out: Mutex::new(out),
+        done: done_set,
+        completed: AtomicUsize::new(0),
+        written: AtomicUsize::new(0),
+        skipped: AtomicUsize::new(0),
+        panics: AtomicUsize::new(0),
+        errors: Mutex::new(None),
+        total: total_rows,
+        start: Instant::now(),
+    };
+    let it = TaskIter {
+        images_root: &a.images,
+        images: &images,
+        synthetics: &synthetics,
+        positives: &positives,
+        pkeys: &pkeys,
+        keys: &keys,
+        known: &known,
+        stage: 0,
+        idx: 0,
+        cursor: 0,
+        current: Vec::new(),
+        err: Arc::new(Mutex::new(None)),
+    };
 
-    // ---------------------------------------------------------------- synthetic negatives
-    for (name, base) in synthetic_images() {
-        let variants = negative_variants(&base)?;
-        for (variant, rgb) in &variants {
-            for (ki, key) in keys.iter().enumerate() {
-                process(&mut out, &done_set, &mut stats, "neg", &name, "synthetic", variant, ki, rgb, key, &known[ki])?;
-            }
-        }
-    }
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(jobs)
+        .build()
+        .context("cannot build the rayon pool")?;
+    eprintln!("jobs: {jobs}, target {total_rows} rows");
+    pool.install(|| {
+        it.par_bridge().for_each(|t| run_task(&ctx, &t));
+    });
 
-    // ---------------------------------------------------------------- positives
-    for (pi, img) in positives.iter().enumerate() {
-        let rel = rel_string(&a.images, img);
-        let category = category_of(&rel);
-        let base = downscale(load_image(img).with_context(|| format!("load {}", rel))?);
-        let (pkey, pid) = positive_key_and_id(pi);
-        let mut marked = base.clone();
-        wm::embed_rgb(&mut marked.data, marked.w, marked.h, &pkey, pid, wm::DEFAULT_STRENGTH);
-        let variants = positive_variants(&marked)?;
-        let pknown = KnownIds::new(&pkey, registry_ids(1000 + pi, a.registry_size));
-        for (variant, rgb) in &variants {
-            process(&mut out, &done_set, &mut stats, "pos", &rel, &category, variant, pi, rgb, &pkey, &pknown)?;
-        }
-    }
-
-    let elapsed = stats.start.elapsed().as_secs_f64();
+    let elapsed = ctx.start.elapsed().as_secs_f64();
+    let written = ctx.written.load(Ordering::Relaxed);
+    let skipped = ctx.skipped.load(Ordering::Relaxed);
+    let panics = ctx.panics.load(Ordering::Relaxed);
     eprintln!(
-        "done: {} new rows, {} already present, {:.0}s total (target {}), {} detector panics",
-        stats.written, done_rows, elapsed, total_rows, stats.panics
+        "done: {written} new rows, {skipped} already present, {elapsed:.0}s total (target {total_rows}), {panics} detector panics"
     );
-    if stats.panics > 0 {
+    if panics > 0 {
         eprintln!(
-            "WARNING: {} rows have z_sync=nan because the detector panicked on flat images \
+            "WARNING: {panics} rows have z_sync=nan because the detector panicked on flat images \
              (src/wm.rs median_filter_nearest); the report counts them separately and they are \
-             excluded from quantiles and extrapolation",
-            stats.panics
+             excluded from quantiles and extrapolation"
         );
     }
-    Ok(())
-}
-
-#[allow(clippy::too_many_arguments)]
-fn process(
-    out: &mut OutCsv,
-    done: &HashSet<String>,
-    stats: &mut Stats,
-    kind: &str,
-    image: &str,
-    category: &str,
-    variant: &str,
-    key_index: usize,
-    rgb: &RgbImageBuf,
-    key: &[u8],
-    known: &KnownIds,
-) -> Result<()> {
-    let id = format!("{kind}|{image}|{variant}|{key_index}");
-    if done.contains(&id) {
-        stats.skipped += 1;
-        return Ok(());
+    if let Some(e) = ctx.errors.lock().unwrap().take() {
+        anyhow::bail!("{e}");
     }
-    let t = Instant::now();
-    let y = imgproc::luma(&rgb.data, rgb.w, rgb.h);
-    // Flat images currently make the detector panic inside `median_filter_nearest`
-    // (sort with NaN). V3-6 may not change `src/`, so keep collecting: record the row with
-    // z_sync = nan and report the crash count instead of aborting the whole run.
-    let det = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        wm::detect_luma(&y, key, Some(known), f64::NEG_INFINITY)
-    })) {
-        Ok(d) => d,
-        Err(_) => {
-            let secs = t.elapsed().as_secs_f64();
-            stats.panics += 1;
-            eprintln!("warning: detector panicked on {image} [{variant}] key {key_index}; recorded z_sync=nan");
-            out.row(&[
-                kind,
-                image,
-                category,
-                variant,
-                &key_index.to_string(),
-                &rgb.w.to_string(),
-                &rgb.h.to_string(),
-                "nan",
-                "",
-                "",
-                &format!("{secs:.3}"),
-            ])?;
-            stats.written += 1;
-            stats.progress();
-            return Ok(());
-        }
-    };
-    let secs = t.elapsed().as_secs_f64();
-
-    let z_id = det.z_id.map(|v| format!("{v:.6}")).unwrap_or_default();
-    out.row(&[
-        kind,
-        image,
-        category,
-        variant,
-        &key_index.to_string(),
-        &rgb.w.to_string(),
-        &rgb.h.to_string(),
-        &format!("{:.6}", det.z_sync),
-        det.method.as_deref().unwrap_or(""),
-        &z_id,
-        &format!("{secs:.3}"),
-    ])?;
-    stats.written += 1;
-    stats.progress();
     Ok(())
 }
 
-struct Stats {
-    written: usize,
-    skipped: usize,
-    panics: usize,
+// ------------------------------------------------------------------ tasks
+
+#[derive(Clone)]
+struct Task {
+    kind: &'static str,
+    image: String,
+    category: String,
+    variant: &'static str,
+    key_index: usize,
+    rgb: Arc<RgbImageBuf>,
+    key: [u8; 32],
+    known: Arc<KnownIds>,
+}
+
+struct TaskCtx {
+    out: Mutex<OutCsv>,
+    done: HashSet<String>,
+    completed: AtomicUsize,
+    written: AtomicUsize,
+    skipped: AtomicUsize,
+    panics: AtomicUsize,
+    errors: Mutex<Option<String>>,
     total: usize,
     start: Instant,
 }
 
-impl Stats {
-    fn progress(&self) {
-        if self.written % 50 != 0 {
+fn finish_one(ctx: &TaskCtx) {
+    let n = ctx.completed.fetch_add(1, Ordering::Relaxed) + 1;
+    if n % 50 == 0 {
+        let elapsed = ctx.start.elapsed().as_secs_f64();
+        let rate = elapsed / n as f64;
+        let remaining = ctx.total.saturating_sub(n) as f64;
+        eprintln!("{n}/{} rows, {elapsed:.0}s elapsed, ETA {:.0}s", ctx.total, remaining * rate);
+    }
+}
+
+fn run_task(ctx: &TaskCtx, t: &Task) {
+    let id = format!("{}|{}|{}|{}", t.kind, t.image, t.variant, t.key_index);
+    if ctx.done.contains(&id) {
+        ctx.skipped.fetch_add(1, Ordering::Relaxed);
+        finish_one(ctx);
+        return;
+    }
+    let hashed = Instant::now();
+    let y = imgproc::luma(&t.rgb.data, t.rgb.w, t.rgb.h);
+    // Flat images currently make the detector panic inside `median_filter_nearest`
+    // (sort with NaN). V3-6 may not change `src/`, so keep collecting: record the row with
+    // z_sync = nan and report the crash count instead of aborting the whole run.
+    let det = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        wm::detect_luma(&y, &t.key, Some(&t.known), f64::NEG_INFINITY)
+    })) {
+        Ok(d) => d,
+        Err(_) => {
+            let secs = hashed.elapsed().as_secs_f64();
+            ctx.panics.fetch_add(1, Ordering::Relaxed);
+            eprintln!("warning: detector panicked on {} [{}] key {}; recorded z_sync=nan", t.image, t.variant, t.key_index);
+            write_row(ctx, t, "nan", "", "", secs);
             return;
         }
-        let elapsed = self.start.elapsed().as_secs_f64();
-        let done = self.written + self.skipped;
-        let remaining = self.total.saturating_sub(done) as f64;
-        let rate = if done > 0 { elapsed / done as f64 } else { 0.0 };
-        eprintln!("{done}/{} rows, {elapsed:.0}s elapsed, ETA {:.0}s", self.total, remaining * rate);
+    };
+    let secs = hashed.elapsed().as_secs_f64();
+    let z_id = det.z_id.map(|v| format!("{v:.6}")).unwrap_or_default();
+    write_row(
+        ctx,
+        t,
+        &format!("{:.6}", det.z_sync),
+        det.method.as_deref().unwrap_or(""),
+        &z_id,
+        secs,
+    );
+}
+
+fn write_row(ctx: &TaskCtx, t: &Task, z_sync: &str, method: &str, z_id: &str, secs: f64) {
+    let row = [
+        t.kind,
+        t.image.as_str(),
+        t.category.as_str(),
+        t.variant,
+        &t.key_index.to_string(),
+        &t.rgb.w.to_string(),
+        &t.rgb.h.to_string(),
+        z_sync,
+        method,
+        z_id,
+        &format!("{secs:.3}"),
+    ];
+    let mut out = ctx.out.lock().unwrap();
+    if let Err(e) = out.row(&row) {
+        *ctx.errors.lock().unwrap() = Some(format!("cannot write the CSV: {e:#}"));
     }
+    drop(out);
+    ctx.written.fetch_add(1, Ordering::Relaxed);
+    finish_one(ctx);
+}
+
+/// Lazily turns images into detection tasks, one image at a time, so only the variants of a
+/// couple of images are in memory even for a 150-image set.
+struct TaskIter<'a> {
+    images_root: &'a Path,
+    images: &'a [PathBuf],
+    synthetics: &'a [(String, RgbImageBuf)],
+    positives: &'a [PathBuf],
+    pkeys: &'a [([u8; 32], Arc<KnownIds>)],
+    keys: &'a [[u8; 32]],
+    known: &'a [Arc<KnownIds>],
+    stage: u8,
+    idx: usize,
+    cursor: usize,
+    current: Vec<Task>,
+    err: Arc<Mutex<Option<String>>>,
+}
+
+impl Iterator for TaskIter<'_> {
+    type Item = Task;
+
+    fn next(&mut self) -> Option<Task> {
+        loop {
+            if self.cursor < self.current.len() {
+                let t = self.current[self.cursor].clone();
+                self.cursor += 1;
+                return Some(t);
+            }
+            self.current.clear();
+            self.cursor = 0;
+            match self.stage {
+                0 => {
+                    if self.idx >= self.images.len() {
+                        self.stage = 1;
+                        self.idx = 0;
+                        continue;
+                    }
+                    let img = &self.images[self.idx];
+                    self.idx += 1;
+                    let rel = rel_string(self.images_root, img);
+                    match load_image(img) {
+                        Ok(base) => match negative_variants(&downscale(base)) {
+                            Ok(vs) => {
+                                self.current = negative_tasks(&rel, &category_of(&rel), vs, self.keys, self.known);
+                            }
+                            Err(e) => {
+                                *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
+                                return None;
+                            }
+                        },
+                        Err(e) => {
+                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
+                            return None;
+                        }
+                    }
+                }
+                1 => {
+                    if self.idx >= self.synthetics.len() {
+                        self.stage = 2;
+                        self.idx = 0;
+                        continue;
+                    }
+                    let (name, base) = &self.synthetics[self.idx];
+                    self.idx += 1;
+                    match negative_variants(base) {
+                        Ok(vs) => {
+                            self.current = negative_tasks(name, "synthetic", vs, self.keys, self.known);
+                        }
+                        Err(e) => {
+                            *self.err.lock().unwrap() = Some(format!("{name}: {e:#}"));
+                            return None;
+                        }
+                    }
+                }
+                _ => {
+                    if self.idx >= self.positives.len() {
+                        return None;
+                    }
+                    let pi = self.idx;
+                    self.idx += 1;
+                    let img = &self.positives[pi];
+                    let rel = rel_string(self.images_root, img);
+                    let base = match load_image(img) {
+                        Ok(b) => downscale(b),
+                        Err(e) => {
+                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
+                            return None;
+                        }
+                    };
+                    let (pkey, pid) = positive_key_and_id(pi);
+                    let mut marked = base;
+                    wm::embed_rgb(&mut marked.data, marked.w, marked.h, &pkey, pid, wm::DEFAULT_STRENGTH);
+                    match positive_variants(&marked) {
+                        Ok(vs) => {
+                            let category = category_of(&rel);
+                            let pknown = self.pkeys[pi].1.clone();
+                            for (variant, rgb) in vs {
+                                self.current.push(Task {
+                                    kind: "pos",
+                                    image: rel.clone(),
+                                    category: category.clone(),
+                                    variant,
+                                    key_index: pi,
+                                    rgb: Arc::new(rgb),
+                                    key: pkey,
+                                    known: pknown.clone(),
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
+                            return None;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn negative_tasks(
+    image: &str,
+    category: &str,
+    variants: Vec<(&'static str, RgbImageBuf)>,
+    keys: &[[u8; 32]],
+    known: &[Arc<KnownIds>],
+) -> Vec<Task> {
+    let mut out = Vec::new();
+    for (variant, rgb) in variants {
+        let rgb = Arc::new(rgb);
+        for (ki, key) in keys.iter().enumerate() {
+            out.push(Task {
+                kind: "neg",
+                image: image.to_string(),
+                category: category.to_string(),
+                variant,
+                key_index: ki,
+                rgb: rgb.clone(),
+                key: *key,
+                known: known[ki].clone(),
+            });
+        }
+    }
+    out
 }
 
 // ------------------------------------------------------------------ CSV
@@ -299,7 +470,7 @@ fn parse_csv_line(line: &str) -> Vec<String> {
     out
 }
 
-/// Keys already in the CSV, as `kind|image|variant|key_index`.
+/// Keys already in the CSV, as `kind|image|variant|key_index` (order independent).
 fn read_done(path: &Path) -> Result<HashSet<String>> {
     let mut set = HashSet::new();
     if !path.exists() {
