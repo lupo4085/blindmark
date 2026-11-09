@@ -1,0 +1,16 @@
+{
+  "1584969284": {
+    "source": "cover.png",
+    "sha256_original": "2b5f99861d2de787df1ad275a18959c91c0b6d5f3304bec68753913dca855cbe",
+    "sha256_marked": "9c4baf39cf6b342f7ea0b9a03cf04488b30ec7746529844b5a9f34c516ada58c",
+    "size": [
+      256,
+      320
+    ],
+    "thumb": "5e78b644.png",
+    "registered_utc": "2026-11-09T20:01:59Z",
+    "tile_px": 128,
+    "strength": 2.6,
+    "output": "out\\cover_wm.png"
+  }
+}
