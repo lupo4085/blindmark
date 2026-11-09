@@ -26,6 +26,27 @@ pub struct Entry {
     pub strength: Option<f32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub output: Option<String>,
+    // Distribution: who this copy was made for. All optional so old registries load.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recipient_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub batch_id: Option<String>,
+}
+
+/// Recipient facts recorded with a copy.
+#[derive(Clone, Debug, Default)]
+pub struct CopyMeta {
+    pub recipient_id: Option<String>,
+    pub recipient_name: Option<String>,
+    pub group_id: Option<String>,
+    pub group_name: Option<String>,
+    pub batch_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -109,6 +130,21 @@ impl Registry {
         strength: f32,
         output: Option<String>,
     ) -> Result<()> {
+        self.register_full(id, source, original, marked, channel, strength, output, None)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn register_full(
+        &mut self,
+        id: u32,
+        source: &str,
+        original: &RgbImageBuf,
+        marked: &RgbImageBuf,
+        channel: Option<String>,
+        strength: f32,
+        output: Option<String>,
+        meta: Option<&CopyMeta>,
+    ) -> Result<()> {
         let thumb_name = format!("{id:08x}.png");
         let th = thumbnail(marked, 512);
         image::save_buffer(self.dir.join(&thumb_name), &th.data, th.w as u32, th.h as u32, image::ColorType::Rgb8)?;
@@ -123,6 +159,11 @@ impl Registry {
             channel: channel.filter(|c| !c.trim().is_empty()),
             strength: Some(strength),
             output,
+            recipient_id: meta.and_then(|m| m.recipient_id.clone()),
+            recipient_name: meta.and_then(|m| m.recipient_name.clone()),
+            group_id: meta.and_then(|m| m.group_id.clone()),
+            group_name: meta.and_then(|m| m.group_name.clone()),
+            batch_id: meta.and_then(|m| m.batch_id.clone()),
         };
         self.entries.insert(id.to_string(), e);
         self.save()
