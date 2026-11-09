@@ -28,9 +28,7 @@
 5. **unsafe 和 Win32**：
    - 每个窗口过程或对话框过程的函数体都要用 `std::panic::catch_unwind` 包起来。panic 绝不能穿过 FFI 边界。
    - 通过 `Box::into_raw` 交出去的指针，必须且只能用 `Box::from_raw` 收回一次。
-6. **做完必须自检**，下面两条都要通过：
-   - `cargo test --release --lib`
-   - `cargo check --features win32-check --bins`（非 Windows 环境），或在 Windows 上 `cargo build --release --bins`
+6. **做完必须自检**：运行 `scripts/check`（Windows 用 `scripts/check.ps1`，其他平台用 `scripts/check.sh`），必须打印 `ALL CHECKS PASSED`。
 
 7. **暂时不跑 `cargo fmt`**：现有代码是手工排版，不符合 rustfmt 的规则。整个仓库的格式化会在 alpha 分支合并后单独开一张卡来做。在那之前**禁止运行 `cargo fmt`**，新写的代码模仿周围代码的风格就可以。
 

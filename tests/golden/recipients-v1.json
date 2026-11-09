@@ -1,0 +1,37 @@
+{
+  "format": "blindmark/recipients/v1",
+  "groups": [
+    {
+      "id": "g_0001",
+      "name": "客户",
+      "parent": null,
+      "note": "",
+      "archived": false
+    },
+    {
+      "id": "g_0002",
+      "name": "2026 秋季",
+      "parent": "g_0001",
+      "note": "",
+      "archived": false
+    }
+  ],
+  "items": [
+    {
+      "id": "r_0001",
+      "name": "张三",
+      "group_id": "g_0002",
+      "note": "约稿",
+      "created_utc": "2026-01-01T00:00:00Z",
+      "archived": false
+    },
+    {
+      "id": "r_0002",
+      "name": "李四",
+      "group_id": "g_0002",
+      "note": "",
+      "created_utc": "2026-01-01T00:00:00Z",
+      "archived": false
+    }
+  ]
+}
