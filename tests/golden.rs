@@ -50,6 +50,7 @@ fn marked_is_detected() {
     assert_eq!(rep.det.method.as_deref(), Some("crc"), "wrong detection method");
 }
 
+/// 同一平台上应逐字节相同；0.1% 的余量只留给不同平台数学库的个别舍入差异。
 #[test]
 fn embed_is_stable() {
     let cover = registry::load_image(&golden().join("cover.png")).unwrap();
@@ -58,6 +59,8 @@ fn embed_is_stable() {
     wm::embed_rgb(&mut again.data, again.w, again.h, &key(), ID, STRENGTH);
     assert_eq!((again.w, again.h), (marked.w, marked.h), "image size changed");
     assert_eq!(again.data.len(), marked.data.len(), "pixel count changed");
+    let total = marked.data.len();
+    let differing = again.data.iter().zip(&marked.data).filter(|(a, b)| a != b).count();
     let worst = again
         .data
         .iter()
@@ -66,6 +69,7 @@ fn embed_is_stable() {
         .max()
         .unwrap();
     assert!(worst <= 1, "re-embedding differs from marked.png by up to {worst} per channel");
+    assert!(differing * 1000 <= total, "re-embedding changed {differing} of {total} bytes (limit 0.1%)");
 }
 
 #[test]
