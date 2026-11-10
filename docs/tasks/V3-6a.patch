@@ -1,0 +1,198 @@
+diff --git a/src/affine.rs b/src/affine.rs
+index 2375c06..e3c2def 100644
+--- a/src/affine.rs
++++ b/src/affine.rs
+@@ -209,7 +209,7 @@ fn peak_pair_lattices(acf: &Acf, pmin: f64) -> Vec<Mat2> {
+             peaks.push((v, [dx, dy]));
+         }
+     }
+-    peaks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
++    peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
+     peaks.truncate(16);
+     let sample = |v: [f64; 2]| -> Option<f64> {
+         let (x, y) = (cx + v[0], cy + v[1]);
+@@ -261,9 +261,9 @@ fn peak_pair_lattices(acf: &Acf, pmin: f64) -> Vec<Mat2> {
+     }
+     let best = cands.iter().map(|c| c.0).fold(f64::MIN, f64::max);
+     let mut good: Vec<_> = cands.iter().filter(|c| c.0 >= 0.8 * best).cloned().collect();
+-    good.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
++    good.sort_by(|a, b| a.1.total_cmp(&b.1));
+     let mut rest = cands.clone();
+-    rest.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
++    rest.sort_by(|a, b| b.0.total_cmp(&a.0));
+     let mut out: Vec<(f64, Mat2)> = vec![];
+     for (_, area, b) in good.into_iter().chain(rest) {
+         let dup = out.iter().any(|(a0, b0)| {
+@@ -328,7 +328,7 @@ fn polar_lattices(acf: &Acf, pmin: f64, top: usize) -> Vec<Mat2> {
+         })
+         .collect();
+     let mut order = scores;
+-    order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
++    order.sort_by(|a, b| b.0.total_cmp(&a.0));
+     let mut picked: Vec<(f64, f64)> = vec![]; // (p, theta)
+     for &(_, ti, pi) in order.iter().take(4000) {
+         let (t, p) = (thetas[ti], ps[pi]);
+@@ -519,10 +519,13 @@ fn best_orientation(p: &Prepared, b: &Mat2, sref: &SyncRef) -> Option<Eval> {
+             let (z, soft) = sref.analyse(&d4(&f, k));
+             Eval { z, soft, b: *b }
+         })
+-        .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())
++        .max_by(|a, b| a.z.total_cmp(&b.z))
+ }
+ 
+ pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
++    if crate::wm::too_flat(y) {
++        return crate::wm::detect_axis(y, key, known, z_thresh);
++    }
+     let sref = SyncRef::new(key);
+     let mut t = std::time::Instant::now();
+     let cands = lattice_candidates(y, 10);
+@@ -535,11 +538,11 @@ pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh:
+             [0.993, 1.0, 1.007]
+                 .iter()
+                 .filter_map(|&s| best_orientation(&p, &mat_scale(b, s), &sref))
+-                .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())
++                .max_by(|a, b| a.z.total_cmp(&b.z))
+                 .map(|e| (e, ci))
+         })
+         .collect();
+-    coarse.sort_by(|a, b| b.0.z.partial_cmp(&a.0.z).unwrap());
++    coarse.sort_by(|a, b| b.0.z.total_cmp(&a.0.z));
+     // fine search: scale first (13 steps), then angle (5 steps) at the best scale
+     let fine = coarse
+         .iter()
+@@ -547,15 +550,15 @@ pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh:
+         .filter_map(|(e, _)| {
+             let p = prepare(y, &e.b);
+             let scales: Vec<Mat2> = (0..13).map(|i| mat_scale(&e.b, 0.985 + 0.0025 * i as f64)).collect();
+-            let bs = scales.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())?;
++            let bs = scales.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.total_cmp(&b.z))?;
+             let angles: Vec<Mat2> = [-0.4f64, -0.2, 0.2, 0.4].iter().map(|da| mat_mul(&rot(da.to_radians()), &bs.b)).collect();
+-            let ba = angles.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.partial_cmp(&b.z).unwrap());
++            let ba = angles.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.total_cmp(&b.z));
+             Some(match ba {
+                 Some(a) if a.z > bs.z => a,
+                 _ => bs,
+             })
+         })
+-        .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap());
++        .max_by(|a, b| a.z.total_cmp(&b.z));
+     tick("coarse+fine folds", &mut t);
+     let coarse: Vec<Eval> = coarse.into_iter().map(|(e, _)| e).collect();
+     let best = match (coarse.into_iter().next(), fine) {
+diff --git a/src/features.rs b/src/features.rs
+index e5a83e5..a9af225 100644
+--- a/src/features.rs
++++ b/src/features.rs
+@@ -154,7 +154,7 @@ pub fn orb(gray: &Plane, n: usize) -> Features {
+             corners = fast9(&cur, 7.0);
+         }
+         let mut scored: Vec<(f32, i32, i32)> = corners.par_iter().map(|&(x, y)| (harris(&cur, x, y), x, y)).collect();
+-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
++        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+         // greedy non-maximum suppression on a coarse grid (3 px)
+         let mut taken = std::collections::HashSet::new();
+         let mut keep = vec![];
+@@ -283,7 +283,7 @@ fn fit_h(src: &[(f64, f64)], dst: &[(f64, f64)]) -> Option<Homography> {
+     let mut m = ata;
+     let mut b = atb;
+     for c in 0..8 {
+-        let piv = (c..8).max_by(|&i, &j| m[i][c].abs().partial_cmp(&m[j][c].abs()).unwrap())?;
++        let piv = (c..8).max_by(|&i, &j| m[i][c].abs().total_cmp(&m[j][c].abs()))?;
+         if m[piv][c].abs() < 1e-12 {
+             return None;
+         }
+diff --git a/src/registry.rs b/src/registry.rs
+index f172375..ec73ae7 100644
+--- a/src/registry.rs
++++ b/src/registry.rs
+@@ -365,7 +365,7 @@ fn phase_corr(t: &Plane, s: &Plane) -> (isize, isize, f64) {
+     let n = r.len() as f64;
+     let mean = r.iter().map(|c| c.re).sum::<f64>() / n;
+     let sd = (r.iter().map(|c| (c.re - mean).powi(2)).sum::<f64>() / n).sqrt().max(1e-12);
+-    let bi = (0..r.len()).max_by(|&i, &j| r[i].re.partial_cmp(&r[j].re).unwrap()).unwrap();
++    let bi = (0..r.len()).max_by(|&i, &j| r[i].re.total_cmp(&r[j].re)).unwrap();
+     let (ky, kx) = ((bi / wp) as isize, (bi % wp) as isize);
+     let dy = if ky < t.h as isize { ky } else { ky - hp as isize };
+     let dx = if kx < t.w as isize { kx } else { kx - wp as isize };
+@@ -418,7 +418,7 @@ fn overlap_corr(s: &Plane, t: &Plane, dy: isize, dx: isize) -> (f64, f64) {
+     if cors.len() < 4 {
+         return (0.0, overlap);
+     }
+-    cors.sort_by(|a, b| a.partial_cmp(b).unwrap());
++    cors.sort_by(|a, b| a.total_cmp(b));
+     (cors[cors.len() / 2], overlap)
+ }
+ 
+diff --git a/src/wm.rs b/src/wm.rs
+index 8f7954b..32cbf22 100644
+--- a/src/wm.rs
++++ b/src/wm.rs
+@@ -106,7 +106,7 @@ pub(crate) fn median_filter_nearest(s: &[f64], size: usize) -> Vec<f64> {
+     (0..n)
+         .map(|i| {
+             let mut win: Vec<f64> = (i - r..=i + r).map(|j| s[j.clamp(0, n - 1) as usize]).collect();
+-            win.sort_by(|a, b| a.partial_cmp(b).unwrap());
++            win.sort_by(|a, b| a.total_cmp(b));
+             win[win.len() / 2]
+         })
+         .collect()
+@@ -150,7 +150,7 @@ pub fn estimate_periods(y: &Plane) -> Vec<f64> {
+         let med = median_filter_nearest(&s, base_win);
+         let prom: Vec<f64> = s.iter().zip(&med).map(|(a, b)| a - b).collect();
+         let mut order: Vec<usize> = (0..s.len()).collect();
+-        order.sort_by(|&i, &j| prom[j].partial_cmp(&prom[i]).unwrap());
++        order.sort_by(|&i, &j| prom[j].total_cmp(&prom[i]));
+         let mut found = vec![];
+         for i in order {
+             if prom[i] <= 0.0 || found.len() >= top_n {
+@@ -405,6 +405,9 @@ pub fn detect_luma(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
+ }
+ 
+ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
++    if too_flat(y) {
++        return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None, basis: None };
++    }
+     let sref = SyncRef::new(key);
+     let cands = estimate_periods(y);
+     // coarse pass (parallel over candidates)
+@@ -419,7 +422,7 @@ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
+             (zb, p0, res)
+         })
+         .collect();
+-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
++    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
+     // fine pass around the best two
+     let sref = &sref;
+     let fine: Vec<(f64, [f64; NBITS], f64)> = scored
+@@ -433,7 +436,7 @@ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
+             })
+         })
+         .collect();
+-    let Some((z, soft, period)) = fine.into_iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) else {
++    let Some((z, soft, period)) = fine.into_iter().max_by(|a, b| a.0.total_cmp(&b.0)) else {
+         return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None, basis: None };
+     };
+     finish(z, &soft, period, key, known, z_thresh)
+@@ -453,7 +456,7 @@ pub(crate) fn finish(z: f64, soft: &[f64; NBITS], period: f64, key: &[u8], known
+     if present {
+         if let Some(k) = known.filter(|k| !k.ids.is_empty()) {
+             let scores: Vec<f64> = k.rows.iter().map(|r| r.iter().zip(soft).map(|(&s, &v)| s as f64 * v).sum()).collect();
+-            let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
++            let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
+             let thr = norm_isf(1e-6 / k.ids.len() as f64).max(5.0);
+             let hamming = k.rows[j].iter().zip(soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count();
+             if best >= thr && hamming <= NBITS / 3 {
+@@ -545,3 +548,12 @@ mod tests {
+         assert!(!d.present, "{d:?}");
+     }
+ }
++
++/// Luma standard deviation below this (grey levels) carries no watermark signal.
++pub const MIN_LUMA_STD: f64 = 1.0;
++pub fn too_flat(y: &Plane) -> bool {
++    let n = y.d.len().max(1) as f64;
++    let mean = y.d.iter().map(|&v| v as f64).sum::<f64>() / n;
++    let var = y.d.iter().map(|&v| { let d = v as f64 - mean; d * d }).sum::<f64>() / n;
++    var.sqrt() < MIN_LUMA_STD
++}
