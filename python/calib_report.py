@@ -96,6 +96,10 @@ def main() -> None:
         print(f"| pos | {v} | {sum(1 for r in pos if r.get('variant') == v)} |")
     print(f"| pos | 合计 | {len(pos)} |")
     print()
+    if rows and "id_ok" in rows[0]:
+        wrong = sum(1 for r in pos if (r.get("id_ok") or "") == "0")
+        print(f"认错编号（id_ok = 0）的次数：{wrong}")
+        print()
     bad = sum(1 for r in neg if not math.isfinite(float(r.get("z_sync", "nan") or "nan")))
     if bad:
         print(
