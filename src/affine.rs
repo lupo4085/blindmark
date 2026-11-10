@@ -209,7 +209,7 @@ fn peak_pair_lattices(acf: &Acf, pmin: f64) -> Vec<Mat2> {
             peaks.push((v, [dx, dy]));
         }
     }
-    peaks.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    peaks.sort_by(|a, b| b.0.total_cmp(&a.0));
     peaks.truncate(16);
     let sample = |v: [f64; 2]| -> Option<f64> {
         let (x, y) = (cx + v[0], cy + v[1]);
@@ -261,9 +261,9 @@ fn peak_pair_lattices(acf: &Acf, pmin: f64) -> Vec<Mat2> {
     }
     let best = cands.iter().map(|c| c.0).fold(f64::MIN, f64::max);
     let mut good: Vec<_> = cands.iter().filter(|c| c.0 >= 0.8 * best).cloned().collect();
-    good.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap());
+    good.sort_by(|a, b| a.1.total_cmp(&b.1));
     let mut rest = cands.clone();
-    rest.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    rest.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut out: Vec<(f64, Mat2)> = vec![];
     for (_, area, b) in good.into_iter().chain(rest) {
         let dup = out.iter().any(|(a0, b0)| {
@@ -328,7 +328,7 @@ fn polar_lattices(acf: &Acf, pmin: f64, top: usize) -> Vec<Mat2> {
         })
         .collect();
     let mut order = scores;
-    order.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    order.sort_by(|a, b| b.0.total_cmp(&a.0));
     let mut picked: Vec<(f64, f64)> = vec![]; // (p, theta)
     for &(_, ti, pi) in order.iter().take(4000) {
         let (t, p) = (thetas[ti], ps[pi]);
@@ -519,10 +519,13 @@ fn best_orientation(p: &Prepared, b: &Mat2, sref: &SyncRef) -> Option<Eval> {
             let (z, soft) = sref.analyse(&d4(&f, k));
             Eval { z, soft, b: *b }
         })
-        .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())
+        .max_by(|a, b| a.z.total_cmp(&b.z))
 }
 
 pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
+    if crate::wm::too_flat(y) {
+        return crate::wm::detect_axis(y, key, known, z_thresh);
+    }
     let sref = SyncRef::new(key);
     let mut t = std::time::Instant::now();
     let cands = lattice_candidates(y, 10);
@@ -535,11 +538,11 @@ pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: 
             [0.993, 1.0, 1.007]
                 .iter()
                 .filter_map(|&s| best_orientation(&p, &mat_scale(b, s), &sref))
-                .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())
+                .max_by(|a, b| a.z.total_cmp(&b.z))
                 .map(|e| (e, ci))
         })
         .collect();
-    coarse.sort_by(|a, b| b.0.z.partial_cmp(&a.0.z).unwrap());
+    coarse.sort_by(|a, b| b.0.z.total_cmp(&a.0.z));
     // fine search: scale first (13 steps), then angle (5 steps) at the best scale
     let fine = coarse
         .iter()
@@ -547,15 +550,15 @@ pub fn detect_affine(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: 
         .filter_map(|(e, _)| {
             let p = prepare(y, &e.b);
             let scales: Vec<Mat2> = (0..13).map(|i| mat_scale(&e.b, 0.985 + 0.0025 * i as f64)).collect();
-            let bs = scales.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.partial_cmp(&b.z).unwrap())?;
+            let bs = scales.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.total_cmp(&b.z))?;
             let angles: Vec<Mat2> = [-0.4f64, -0.2, 0.2, 0.4].iter().map(|da| mat_mul(&rot(da.to_radians()), &bs.b)).collect();
-            let ba = angles.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.partial_cmp(&b.z).unwrap());
+            let ba = angles.par_iter().filter_map(|b| best_orientation(&p, b, &sref)).max_by(|a, b| a.z.total_cmp(&b.z));
             Some(match ba {
                 Some(a) if a.z > bs.z => a,
                 _ => bs,
             })
         })
-        .max_by(|a, b| a.z.partial_cmp(&b.z).unwrap());
+        .max_by(|a, b| a.z.total_cmp(&b.z));
     tick("coarse+fine folds", &mut t);
     let coarse: Vec<Eval> = coarse.into_iter().map(|(e, _)| e).collect();
     let best = match (coarse.into_iter().next(), fine) {
