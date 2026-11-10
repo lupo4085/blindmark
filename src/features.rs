@@ -154,7 +154,7 @@ pub fn orb(gray: &Plane, n: usize) -> Features {
             corners = fast9(&cur, 7.0);
         }
         let mut scored: Vec<(f32, i32, i32)> = corners.par_iter().map(|&(x, y)| (harris(&cur, x, y), x, y)).collect();
-        scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+        scored.sort_by(|a, b| b.0.total_cmp(&a.0));
         // greedy non-maximum suppression on a coarse grid (3 px)
         let mut taken = std::collections::HashSet::new();
         let mut keep = vec![];
@@ -283,7 +283,7 @@ fn fit_h(src: &[(f64, f64)], dst: &[(f64, f64)]) -> Option<Homography> {
     let mut m = ata;
     let mut b = atb;
     for c in 0..8 {
-        let piv = (c..8).max_by(|&i, &j| m[i][c].abs().partial_cmp(&m[j][c].abs()).unwrap())?;
+        let piv = (c..8).max_by(|&i, &j| m[i][c].abs().total_cmp(&m[j][c].abs()))?;
         if m[piv][c].abs() < 1e-12 {
             return None;
         }

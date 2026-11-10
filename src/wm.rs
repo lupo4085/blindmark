@@ -106,7 +106,7 @@ pub(crate) fn median_filter_nearest(s: &[f64], size: usize) -> Vec<f64> {
     (0..n)
         .map(|i| {
             let mut win: Vec<f64> = (i - r..=i + r).map(|j| s[j.clamp(0, n - 1) as usize]).collect();
-            win.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            win.sort_by(|a, b| a.total_cmp(b));
             win[win.len() / 2]
         })
         .collect()
@@ -150,7 +150,7 @@ pub fn estimate_periods(y: &Plane) -> Vec<f64> {
         let med = median_filter_nearest(&s, base_win);
         let prom: Vec<f64> = s.iter().zip(&med).map(|(a, b)| a - b).collect();
         let mut order: Vec<usize> = (0..s.len()).collect();
-        order.sort_by(|&i, &j| prom[j].partial_cmp(&prom[i]).unwrap());
+        order.sort_by(|&i, &j| prom[j].total_cmp(&prom[i]));
         let mut found = vec![];
         for i in order {
             if prom[i] <= 0.0 || found.len() >= top_n {
@@ -405,6 +405,9 @@ pub fn detect_luma(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
 }
 
 pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
+    if too_flat(y) {
+        return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None, basis: None };
+    }
     let sref = SyncRef::new(key);
     let cands = estimate_periods(y);
     // coarse pass (parallel over candidates)
@@ -419,7 +422,7 @@ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
             (zb, p0, res)
         })
         .collect();
-    scored.sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap());
+    scored.sort_by(|a, b| b.0.total_cmp(&a.0));
     // fine pass around the best two
     let sref = &sref;
     let fine: Vec<(f64, [f64; NBITS], f64)> = scored
@@ -433,7 +436,7 @@ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
             })
         })
         .collect();
-    let Some((z, soft, period)) = fine.into_iter().max_by(|a, b| a.0.partial_cmp(&b.0).unwrap()) else {
+    let Some((z, soft, period)) = fine.into_iter().max_by(|a, b| a.0.total_cmp(&b.0)) else {
         return Detection { found: false, present: false, image_id: None, method: None, z_sync: f64::NAN, z_id: None, period_px: None, basis: None };
     };
     finish(z, &soft, period, key, known, z_thresh)
@@ -453,7 +456,7 @@ pub(crate) fn finish(z: f64, soft: &[f64; NBITS], period: f64, key: &[u8], known
     if present {
         if let Some(k) = known.filter(|k| !k.ids.is_empty()) {
             let scores: Vec<f64> = k.rows.iter().map(|r| r.iter().zip(soft).map(|(&s, &v)| s as f64 * v).sum()).collect();
-            let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.partial_cmp(b.1).unwrap()).unwrap();
+            let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
             let thr = norm_isf(1e-6 / k.ids.len() as f64).max(5.0);
             let hamming = k.rows[j].iter().zip(soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count();
             if best >= thr && hamming <= NBITS / 3 {
@@ -544,4 +547,93 @@ mod tests {
         let d = detect_rgb(&synthetic(w, h), w, h, &key, None);
         assert!(!d.present, "{d:?}");
     }
+
+    /// Flat luma of a solid RGB image (what the detector actually sees).
+    fn solid_luma(w: usize, h: usize, c: [u8; 3]) -> Plane {
+        let mut rgb = vec![0u8; w * h * 3];
+        for px in rgb.chunks_mut(3) {
+            px.copy_from_slice(&c);
+        }
+        imgproc::luma(&rgb, w, h)
+    }
+
+    fn jpeg75(rgb: &[u8], w: usize, h: usize) -> Vec<u8> {
+        let mut buf = Vec::new();
+        {
+            let mut cur = std::io::Cursor::new(&mut buf);
+            let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, 75);
+            enc.encode(rgb, w as u32, h as u32, image::ExtendedColorType::Rgb8).unwrap();
+        }
+        image::load_from_memory(&buf).unwrap().to_rgb8().into_raw()
+    }
+
+    fn assert_flat(d: &Detection, what: &str) {
+        assert!(!d.found, "{what}: {d:?}");
+        assert!(!d.present, "{what}: {d:?}");
+        assert!(d.z_sync.is_nan(), "{what}: z_sync={}", d.z_sync);
+    }
+
+    #[test]
+    fn flat_images_are_not_detected_and_never_panic() {
+        let key = [0x42u8; 32];
+        for c in [[255, 255, 255], [0, 0, 0], [120, 90, 200]] {
+            let y = solid_luma(800, 600, c);
+            assert_flat(&detect_luma(&y, &key, None, Z_THRESH), &format!("solid {c:?}"));
+        }
+    }
+
+    #[test]
+    fn flat_images_survive_jpeg_75() {
+        let (w, h) = (800usize, 600usize);
+        let key = [0x42u8; 32];
+        for c in [[255, 255, 255], [0, 0, 0], [120, 90, 200]] {
+            let mut rgb = vec![0u8; w * h * 3];
+            for px in rgb.chunks_mut(3) {
+                px.copy_from_slice(&c);
+            }
+            let decoded = jpeg75(&rgb, w, h);
+            let y = imgproc::luma(&decoded, w, h);
+            assert_flat(&detect_luma(&y, &key, None, Z_THRESH), &format!("jpeg solid {c:?}"));
+        }
+    }
+
+    #[test]
+    fn horizontal_gradient_has_a_finite_score() {
+        let (w, h) = (800usize, 600usize);
+        let mut rgb = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                let v = (x * 255 / (w - 1)) as u8;
+                let i = (y * w + x) * 3;
+                rgb[i] = v;
+                rgb[i + 1] = v;
+                rgb[i + 2] = v;
+            }
+        }
+        let y = imgproc::luma(&rgb, w, h);
+        let d = detect_luma(&y, &[0x42u8; 32], None, Z_THRESH);
+        assert!(d.z_sync.is_finite(), "gradient: {d:?}");
+    }
+
+    /// Alternating +/-std around 128 gives exactly the requested population std.
+    fn plane_with_std(std: f64) -> Plane {
+        let n = 64 * 64;
+        let d = (0..n).map(|i| 128.0f32 + if i % 2 == 0 { std as f32 } else { -(std as f32) }).collect();
+        Plane::from_vec(64, 64, d)
+    }
+
+    #[test]
+    fn too_flat_threshold() {
+        assert!(too_flat(&plane_with_std(0.5)), "std 0.5 must be flat");
+        assert!(!too_flat(&plane_with_std(2.0)), "std 2.0 must not be flat");
+    }
+}
+
+/// Luma standard deviation below this (grey levels) carries no watermark signal.
+pub const MIN_LUMA_STD: f64 = 1.0;
+pub fn too_flat(y: &Plane) -> bool {
+    let n = y.d.len().max(1) as f64;
+    let mean = y.d.iter().map(|&v| v as f64).sum::<f64>() / n;
+    let var = y.d.iter().map(|&v| { let d = v as f64 - mean; d * d }).sum::<f64>() / n;
+    var.sqrt() < MIN_LUMA_STD
 }

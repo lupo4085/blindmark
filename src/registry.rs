@@ -365,7 +365,7 @@ fn phase_corr(t: &Plane, s: &Plane) -> (isize, isize, f64) {
     let n = r.len() as f64;
     let mean = r.iter().map(|c| c.re).sum::<f64>() / n;
     let sd = (r.iter().map(|c| (c.re - mean).powi(2)).sum::<f64>() / n).sqrt().max(1e-12);
-    let bi = (0..r.len()).max_by(|&i, &j| r[i].re.partial_cmp(&r[j].re).unwrap()).unwrap();
+    let bi = (0..r.len()).max_by(|&i, &j| r[i].re.total_cmp(&r[j].re)).unwrap();
     let (ky, kx) = ((bi / wp) as isize, (bi % wp) as isize);
     let dy = if ky < t.h as isize { ky } else { ky - hp as isize };
     let dx = if kx < t.w as isize { kx } else { kx - wp as isize };
@@ -418,7 +418,7 @@ fn overlap_corr(s: &Plane, t: &Plane, dy: isize, dx: isize) -> (f64, f64) {
     if cors.len() < 4 {
         return (0.0, overlap);
     }
-    cors.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    cors.sort_by(|a, b| a.total_cmp(b));
     (cors[cors.len() / 2], overlap)
 }
 
