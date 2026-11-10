@@ -106,6 +106,7 @@ fn main() -> Result<()> {
     let total_rows = images.len() * 3 * a.keys + synthetics.len() * 3 * a.keys + positives.len() * 4;
     let done_set = if a.resume { read_done(&a.out)? } else { HashSet::new() };
     let out = OutCsv::open(&a.out, !a.resume || !a.out.exists())?;
+    let skipped_images: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
 
     let ctx = TaskCtx {
         out: Mutex::new(out),
@@ -130,7 +131,7 @@ fn main() -> Result<()> {
         idx: 0,
         cursor: 0,
         current: Vec::new(),
-        err: Arc::new(Mutex::new(None)),
+        skipped: skipped_images.clone(),
     };
 
     let pool = rayon::ThreadPoolBuilder::new()
@@ -151,11 +152,17 @@ fn main() -> Result<()> {
     );
     if panics > 0 {
         eprintln!(
-            "WARNING: {panics} rows have z_sync=nan because the detector panicked on flat images \
-             (src/wm.rs median_filter_nearest); the report counts them separately and they are \
-             excluded from quantiles and extrapolation"
+            "WARNING: {panics} rows have z_sync=nan — V3-6a 之后不应再出现，留作保险；\
+             这些行不参与分位数与外推"
         );
     }
+    let skipped_images = skipped_images.lock().unwrap();
+    if skipped_images.is_empty() {
+        eprintln!("skipped 0 images");
+    } else {
+        eprintln!("skipped {} images: {}", skipped_images.len(), skipped_images.join(", "));
+    }
+    drop(skipped_images);
     if let Some(e) = ctx.errors.lock().unwrap().take() {
         anyhow::bail!("{e}");
     }
@@ -207,9 +214,7 @@ fn run_task(ctx: &TaskCtx, t: &Task) {
     }
     let hashed = Instant::now();
     let y = imgproc::luma(&t.rgb.data, t.rgb.w, t.rgb.h);
-    // Flat images currently make the detector panic inside `median_filter_nearest`
-    // (sort with NaN). V3-6 may not change `src/`, so keep collecting: record the row with
-    // z_sync = nan and report the crash count instead of aborting the whole run.
+    // 保险：V3-6a 之后不应再出现，留作保险；真发生了就记 nan 并计数。
     let det = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         wm::detect_luma(&y, &t.key, Some(&t.known), f64::NEG_INFINITY)
     })) {
@@ -271,7 +276,19 @@ struct TaskIter<'a> {
     idx: usize,
     cursor: usize,
     current: Vec<Task>,
-    err: Arc<Mutex<Option<String>>>,
+    skipped: Arc<Mutex<Vec<String>>>,
+}
+
+impl TaskIter<'_> {
+    /// A bad image must not stop a long run: warn once, remember it, and move on.
+    fn skip_image(&self, image: &str, e: anyhow::Error) {
+        let mut list = self.skipped.lock().unwrap();
+        if list.iter().any(|s| s == image) {
+            return; // already reported from the other stage (negatives / positives)
+        }
+        eprintln!("warning: skipped {image}: {e:#}");
+        list.push(image.to_string());
+    }
 }
 
 impl Iterator for TaskIter<'_> {
@@ -296,19 +313,20 @@ impl Iterator for TaskIter<'_> {
                     let img = &self.images[self.idx];
                     self.idx += 1;
                     let rel = rel_string(self.images_root, img);
-                    match load_image(img) {
-                        Ok(base) => match negative_variants(&downscale(base)) {
-                            Ok(vs) => {
-                                self.current = negative_tasks(&rel, &category_of(&rel), vs, self.keys, self.known);
-                            }
-                            Err(e) => {
-                                *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
-                                return None;
-                            }
-                        },
+                    let base = match load_image(img) {
+                        Ok(b) => downscale(b),
                         Err(e) => {
-                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
-                            return None;
+                            self.skip_image(&rel, e);
+                            continue;
+                        }
+                    };
+                    match negative_variants(&base) {
+                        Ok(vs) => {
+                            self.current = negative_tasks(&rel, &category_of(&rel), vs, self.keys, self.known);
+                        }
+                        Err(e) => {
+                            self.skip_image(&rel, e);
+                            continue;
                         }
                     }
                 }
@@ -325,8 +343,8 @@ impl Iterator for TaskIter<'_> {
                             self.current = negative_tasks(name, "synthetic", vs, self.keys, self.known);
                         }
                         Err(e) => {
-                            *self.err.lock().unwrap() = Some(format!("{name}: {e:#}"));
-                            return None;
+                            self.skip_image(name, e);
+                            continue;
                         }
                     }
                 }
@@ -341,8 +359,8 @@ impl Iterator for TaskIter<'_> {
                     let base = match load_image(img) {
                         Ok(b) => downscale(b),
                         Err(e) => {
-                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
-                            return None;
+                            self.skip_image(&rel, e);
+                            continue;
                         }
                     };
                     let (pkey, pid) = positive_key_and_id(pi);
@@ -366,8 +384,8 @@ impl Iterator for TaskIter<'_> {
                             }
                         }
                         Err(e) => {
-                            *self.err.lock().unwrap() = Some(format!("{rel}: {e:#}"));
-                            return None;
+                            self.skip_image(&rel, e);
+                            continue;
                         }
                     }
                 }
