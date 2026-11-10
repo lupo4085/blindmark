@@ -11,6 +11,13 @@ pub const DEFAULT_STRENGTH: f32 = 2.6;
 pub const Z_THRESH: f64 = 6.5;
 pub const Z_THRESH_STRICT: f64 = 7.5;
 
+/// Per-check false-match budget for registry matching.
+pub const REGISTRY_FP: f64 = 1e-6;
+
+/// Without a decoded ID, report "watermark probably present" only above this sync score.
+/// Calibrated in V3-6: max over 15,480 unmarked checks was 6.99; min over identified marked copies was 10.1.
+pub const Z_PRESENT_ONLY: f64 = 8.0;
+
 pub fn tile_size_for(h: usize, w: usize) -> usize {
     (2 * G).max((h.min(w) as f64 / 4.0).round() as usize)
 }
@@ -442,30 +449,58 @@ pub fn detect_axis(y: &Plane, key: &[u8], known: Option<&KnownIds>, z_thresh: f6
     finish(z, &soft, period, key, known, z_thresh)
 }
 
+/// Largest `k` such that `n_ids * P(Binomial(NBITS, 1/2) <= k) <= REGISTRY_FP`.
+/// `None` if even `k = 0` exceeds the budget (registry too large to match safely).
+pub fn registry_max_hamming(n_ids: usize) -> Option<usize> {
+    let n = NBITS as f64;
+    let scale = 1.0 / 2f64.powi(NBITS as i32);
+    let mut c = 1.0f64; // C(NBITS, 0)
+    let mut cum = 0.0f64;
+    let mut best = None;
+    for i in 0..=NBITS {
+        cum += c * scale;
+        if (n_ids as f64) * cum <= REGISTRY_FP {
+            best = Some(i);
+        } else {
+            break;
+        }
+        c = c * (n - i as f64) / (i as f64 + 1.0);
+    }
+    best
+}
+
 /// Decision step shared by all synchronisation paths: CRC decode, then registry ML decode.
 pub(crate) fn finish(z: f64, soft: &[f64; NBITS], period: f64, key: &[u8], known: Option<&KnownIds>, z_thresh: f64) -> Detection {
-    let present = z >= z_thresh;
+    let strong = z >= z_thresh;
+    let present_only = z >= z_thresh.max(Z_PRESENT_ONLY);
     let mut bits = [0u8; NBITS];
     for i in 0..NBITS {
         bits[i] = (soft[i] > 0.0) as u8;
     }
     let (id, ok) = keys::decode_payload(key, &bits);
-    if present && ok {
-        return Detection { found: true, present, image_id: Some(id), method: Some("crc".into()), z_sync: z, z_id: None, period_px: Some(period), basis: None };
+    if strong && ok {
+        return Detection { found: true, present: true, image_id: Some(id), method: Some("crc".into()), z_sync: z, z_id: None, period_px: Some(period), basis: None };
     }
-    if present {
+    if strong {
         if let Some(k) = known.filter(|k| !k.ids.is_empty()) {
             let scores: Vec<f64> = k.rows.iter().map(|r| r.iter().zip(soft).map(|(&s, &v)| s as f64 * v).sum()).collect();
             let (j, &best) = scores.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap();
-            let thr = norm_isf(1e-6 / k.ids.len() as f64).max(5.0);
-            let hamming = k.rows[j].iter().zip(soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count();
-            if best >= thr && hamming <= NBITS / 3 {
-                return Detection { found: true, present, image_id: Some(k.ids[j]), method: Some("registry".into()), z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
+            let thr = norm_isf(REGISTRY_FP / k.ids.len() as f64).max(5.0);
+            let hammings: Vec<usize> = k
+                .rows
+                .iter()
+                .map(|r| r.iter().zip(soft).filter(|(s, v)| (**s > 0) != (**v > 0.0)).count())
+                .collect();
+            let limit = registry_max_hamming(k.ids.len());
+            let within = |h: usize| limit.is_some_and(|lim| h <= lim);
+            let matches = hammings.iter().filter(|&&h| within(h)).count();
+            if best >= thr && within(hammings[j]) && matches == 1 {
+                return Detection { found: true, present: true, image_id: Some(k.ids[j]), method: Some("registry".into()), z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
             }
-            return Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
+            return Detection { found: false, present: present_only, image_id: None, method: None, z_sync: z, z_id: Some(best), period_px: Some(period), basis: None };
         }
     }
-    Detection { found: false, present, image_id: None, method: None, z_sync: z, z_id: None, period_px: Some(period), basis: None }
+    Detection { found: false, present: present_only, image_id: None, method: None, z_sync: z, z_id: None, period_px: Some(period), basis: None }
 }
 
 /// Inverse survival function of N(0,1) (Acklam's rational approximation).
@@ -626,6 +661,80 @@ mod tests {
     fn too_flat_threshold() {
         assert!(too_flat(&plane_with_std(0.5)), "std 0.5 must be flat");
         assert!(!too_flat(&plane_with_std(2.0)), "std 2.0 must not be flat");
+    }
+
+    #[test]
+    fn registry_max_hamming_values() {
+        assert_eq!(registry_max_hamming(1000), Some(4));
+        assert_eq!(registry_max_hamming(10_000), Some(3));
+        assert_eq!(registry_max_hamming(100_000), Some(2));
+        assert_eq!(registry_max_hamming(1), Some(7));
+    }
+
+    fn soft_from_bits(bits: &[u8; NBITS]) -> [f64; NBITS] {
+        let mut soft = [0.0f64; NBITS];
+        for i in 0..NBITS {
+            soft[i] = if bits[i] == 1 { 10.0 } else { -10.0 };
+        }
+        soft
+    }
+
+    /// Bits of the payload with `flips` sign changes, so the CRC no longer passes.
+    fn flipped_soft(key: &[u8], id: u32, flips: usize) -> [f64; NBITS] {
+        let bits = keys::encode_payload(key, id);
+        let mut soft = soft_from_bits(&bits);
+        for i in 0..flips {
+            soft[i] = -soft[i];
+        }
+        soft
+    }
+
+    fn random_ids(n: usize) -> Vec<u32> {
+        (0..n as u32).map(|i| i.wrapping_mul(2_654_435_761).wrapping_add(0x9E37_79B9)).collect()
+    }
+
+    #[test]
+    fn registry_does_not_pick_a_wrong_id() {
+        let key = [0x5Au8; 32];
+        let a = 0x1234_5678u32;
+        let soft = flipped_soft(&key, a, 3);
+        // sanity: three flips must break the CRC (the test relies on the registry branch)
+        let mut bits = [0u8; NBITS];
+        for i in 0..NBITS {
+            bits[i] = (soft[i] > 0.0) as u8;
+        }
+        assert!(!keys::decode_payload(&key, &bits).1, "CRC must fail after 3 flips");
+
+        let ids = random_ids(1000);
+        assert!(!ids.contains(&a), "test ids must not contain the true id");
+        let known = KnownIds::new(&key, ids);
+        let d = finish(20.0, &soft, 128.0, &key, Some(&known), Z_THRESH);
+        assert!(!d.found, "a registry without the true id must not match: {d:?}");
+
+        let mut ids_with_x = random_ids(1000);
+        ids_with_x[500] = a;
+        let known = KnownIds::new(&key, ids_with_x);
+        let d = finish(20.0, &soft, 128.0, &key, Some(&known), Z_THRESH);
+        assert!(d.found && d.image_id == Some(a), "the true id must be found: {d:?}");
+    }
+
+    #[test]
+    fn present_without_id_needs_a_high_score() {
+        let key = [0x5Au8; 32];
+        let soft = flipped_soft(&key, 0x1234_5678, 3);
+        let d = finish(7.0, &soft, 128.0, &key, None, Z_THRESH);
+        assert!(!d.found && !d.present, "z=7.0 must not claim presence: {d:?}");
+        let d = finish(8.5, &soft, 128.0, &key, None, Z_THRESH);
+        assert!(!d.found && d.present, "z=8.5 may claim presence: {d:?}");
+    }
+
+    #[test]
+    fn decoded_id_at_low_score_is_present() {
+        let key = [0x5Au8; 32];
+        let bits = keys::encode_payload(&key, 0x1234_5678);
+        let soft = soft_from_bits(&bits);
+        let d = finish(6.6, &soft, 128.0, &key, None, Z_THRESH);
+        assert!(d.found && d.present, "CRC hit at 6.6 must be found and present: {d:?}");
     }
 }
 

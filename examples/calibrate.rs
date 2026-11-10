@@ -42,7 +42,7 @@ const IMAGE_EXTS: &[&str] = &["png", "jpg", "jpeg", "webp", "bmp", "tif", "tiff"
 const MAX_SIDE: usize = 1600;
 const POSITIVES: usize = 40;
 const SEED: u64 = 0xCA11B;
-const CSV_HEADER: &str = "kind,image,category,variant,key_index,w,h,z_sync,method,z_id,seconds";
+const CSV_HEADER: &str = "kind,image,category,variant,key_index,w,h,z_sync,method,z_id,seconds,id_ok";
 
 #[derive(Parser)]
 #[command(name = "calibrate", about = "Collect z_sync scores for false-positive calibration")]
@@ -68,6 +68,9 @@ struct Args {
     /// Number of detection tasks running at once (default: half the logical CPUs).
     #[arg(long)]
     jobs: Option<usize>,
+    /// Only run the positive samples (registry contains each true id).
+    #[arg(long)]
+    skip_negatives: bool,
 }
 
 fn default_jobs() -> usize {
@@ -97,13 +100,25 @@ fn main() -> Result<()> {
     let positives = pick_positives(&a.images, &images, POSITIVES);
     let pkeys: Vec<([u8; 32], Arc<KnownIds>)> = (0..positives.len())
         .map(|pi| {
-            let (k, _) = positive_key_and_id(pi);
-            (k, Arc::new(KnownIds::new(&k, registry_ids(1000 + pi, a.registry_size))))
+            let (k, pid) = positive_key_and_id(pi);
+            // V3-6b: the registry for a positive sample contains its true id, otherwise the
+            // "wrong id" rate cannot be measured.
+            let mut ids = registry_ids(1000 + pi, a.registry_size);
+            if !ids.is_empty() {
+                let at = pi % ids.len();
+                ids[at] = pid;
+            }
+            (k, Arc::new(KnownIds::new(&k, ids)))
         })
         .collect();
-    let synthetics = synthetic_images();
+    let synthetics = if a.skip_negatives { Vec::new() } else { synthetic_images() };
 
-    let total_rows = images.len() * 3 * a.keys + synthetics.len() * 3 * a.keys + positives.len() * 4;
+    let neg_rows = if a.skip_negatives {
+        0
+    } else {
+        images.len() * 3 * a.keys + synthetics.len() * 3 * a.keys
+    };
+    let total_rows = neg_rows + positives.len() * 4;
     let done_set = if a.resume { read_done(&a.out)? } else { HashSet::new() };
     let out = OutCsv::open(&a.out, !a.resume || !a.out.exists())?;
     let skipped_images: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -127,7 +142,7 @@ fn main() -> Result<()> {
         pkeys: &pkeys,
         keys: &keys,
         known: &known,
-        stage: 0,
+        stage: if a.skip_negatives { 2 } else { 0 },
         idx: 0,
         cursor: 0,
         current: Vec::new(),
@@ -181,6 +196,8 @@ struct Task {
     rgb: Arc<RgbImageBuf>,
     key: [u8; 32],
     known: Arc<KnownIds>,
+    /// Set for positive samples: the id that was actually embedded.
+    expected_id: Option<u32>,
 }
 
 struct TaskCtx {
@@ -223,23 +240,34 @@ fn run_task(ctx: &TaskCtx, t: &Task) {
             let secs = hashed.elapsed().as_secs_f64();
             ctx.panics.fetch_add(1, Ordering::Relaxed);
             eprintln!("warning: detector panicked on {} [{}] key {}; recorded z_sync=nan", t.image, t.variant, t.key_index);
-            write_row(ctx, t, "nan", "", "", secs);
+            write_row(ctx, t, "nan", "", "", "", secs);
             return;
         }
     };
     let secs = hashed.elapsed().as_secs_f64();
     let z_id = det.z_id.map(|v| format!("{v:.6}")).unwrap_or_default();
+    let id_ok = match (t.expected_id, det.found) {
+        (Some(pid), true) => {
+            if det.image_id == Some(pid) {
+                "1"
+            } else {
+                "0"
+            }
+        }
+        _ => "",
+    };
     write_row(
         ctx,
         t,
         &format!("{:.6}", det.z_sync),
         det.method.as_deref().unwrap_or(""),
         &z_id,
+        id_ok,
         secs,
     );
 }
 
-fn write_row(ctx: &TaskCtx, t: &Task, z_sync: &str, method: &str, z_id: &str, secs: f64) {
+fn write_row(ctx: &TaskCtx, t: &Task, z_sync: &str, method: &str, z_id: &str, id_ok: &str, secs: f64) {
     let row = [
         t.kind,
         t.image.as_str(),
@@ -252,6 +280,7 @@ fn write_row(ctx: &TaskCtx, t: &Task, z_sync: &str, method: &str, z_id: &str, se
         method,
         z_id,
         &format!("{secs:.3}"),
+        id_ok,
     ];
     let mut out = ctx.out.lock().unwrap();
     if let Err(e) = out.row(&row) {
@@ -380,6 +409,7 @@ impl Iterator for TaskIter<'_> {
                                     rgb: Arc::new(rgb),
                                     key: pkey,
                                     known: pknown.clone(),
+                                    expected_id: Some(pid),
                                 });
                             }
                         }
@@ -414,6 +444,7 @@ fn negative_tasks(
                 rgb: rgb.clone(),
                 key: *key,
                 known: known[ki].clone(),
+                expected_id: None,
             });
         }
     }
