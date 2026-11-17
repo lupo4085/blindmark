@@ -125,6 +125,51 @@ pub fn read_key_file(path: &Path) -> Result<Vec<u8>, UserError> {
     keys::parse_key_file(&text).map_err(|e| invalid(e))
 }
 
+/// The 24-word mnemonic of a key, or the user-facing reason it has none.
+pub fn key_words(key: &[u8]) -> Result<Vec<String>, UserError> {
+    keys::key_to_words(key)
+        .map_err(|e| UserError { message: words_error_message(&e), detail: format!("{e:?}") })
+}
+
+/// Write `key` to `path`. An existing file is never overwritten: the same key is a
+/// no-op, another key is an error.
+pub fn write_key_bytes(key: &[u8; 32], path: &Path) -> Result<Vec<u8>, UserError> {
+    if path.exists() {
+        let existing = read_key_file(path)?;
+        let fp = keys::fingerprint(&existing);
+        if fp == keys::fingerprint(key) {
+            return Ok(existing);
+        }
+        return Err(UserError {
+            message: format!("这里已经有另一把密钥（密钥指纹 {fp}），不会覆盖它。请换一个位置。"),
+            detail: format!("{} already exists with key fingerprint {fp}", path.display()),
+        });
+    }
+    let fail = |e: anyhow::Error| UserError { message: key_create_message(path), detail: format!("{e:#}") };
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| fail(e.into()))?;
+    }
+    std::fs::write(path, hex::encode(key) + "\n").map_err(|e| fail(e.into()))?;
+    Ok(key.to_vec())
+}
+
+/// Recover a key from mnemonic text and write it to `path`.
+pub fn restore_key_file(text: &str, path: &Path) -> Result<Vec<u8>, UserError> {
+    let key = keys::key_from_words(text)
+        .map_err(|e| UserError { message: words_error_message(&e), detail: format!("{e:?}") })?;
+    write_key_bytes(&key, path)
+}
+
+/// The single place where a [`keys::WordsError`] becomes Chinese copy.
+pub fn words_error_message(e: &keys::WordsError) -> String {
+    match e {
+        keys::WordsError::WrongLength(_) => "这把密钥不是标准长度，不能生成助记词。请直接备份密钥文件。".into(),
+        keys::WordsError::WordCount(n) => format!("需要 24 个词，现在是 {n} 个。"),
+        keys::WordsError::UnknownWord(i, w) => format!("第 {i} 个词“{w}”不在词表里，请检查拼写。"),
+        keys::WordsError::Checksum => "这些词对不上校验，可能有一个词抄错了，或者顺序不对。请逐个核对。".into(),
+    }
+}
+
 /// Copy the files in `src` into `dst`, returning how many were copied.
 pub fn copy_dir(src: &Path, dst: &Path) -> Result<usize, UserError> {
     let fail = |e: anyhow::Error| UserError {
@@ -707,6 +752,52 @@ mod tests {
         std::fs::write(&path, "not a key").unwrap();
         let err = read_key_file(&path).unwrap_err();
         assert!(err.message.starts_with("bad.key"), "{}", err.message);
+    }
+
+    #[test]
+    fn restore_same_key_leaves_file_alone() {
+        let base = tmp("restore-same");
+        let path = base.join("blindmark.key");
+        let key = create_key_file(&path).unwrap();
+        let fixed: [u8; 32] = key.as_slice().try_into().unwrap();
+        let before = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let words = key_words(&fixed).unwrap();
+        let restored = restore_key_file(&words.join("\n"), &path).unwrap();
+        assert_eq!(restored, key);
+        let after = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert_eq!(before, after, "an existing file with the same key must not be written again");
+    }
+
+    #[test]
+    fn restore_refuses_another_key() {
+        let base = tmp("restore-other");
+        let path = base.join("blindmark.key");
+        let original = create_key_file(&path).unwrap();
+        let other = key().to_vec();
+        let words = key_words(&other).unwrap();
+        let err = restore_key_file(&words.join(" "), &path).unwrap_err();
+        assert!(err.message.starts_with("这里已经有另一把密钥（密钥指纹 "), "{}", err.message);
+        assert!(err.message.ends_with("），不会覆盖它。请换一个位置。"), "{}", err.message);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), hex::encode(&original) + "\n");
+    }
+
+    #[test]
+    fn words_errors_use_the_card_copy() {
+        assert_eq!(
+            words_error_message(&keys::WordsError::WrongLength(16)),
+            "这把密钥不是标准长度，不能生成助记词。请直接备份密钥文件。"
+        );
+        assert_eq!(words_error_message(&keys::WordsError::WordCount(23)), "需要 24 个词，现在是 23 个。");
+        assert_eq!(
+            words_error_message(&keys::WordsError::UnknownWord(1, "abandom".into())),
+            "第 1 个词“abandom”不在词表里，请检查拼写。"
+        );
+        assert_eq!(
+            words_error_message(&keys::WordsError::Checksum),
+            "这些词对不上校验，可能有一个词抄错了，或者顺序不对。请逐个核对。"
+        );
+        let bad = [0u8; 16];
+        assert_eq!(key_words(&bad).unwrap_err().message, "这把密钥不是标准长度，不能生成助记词。请直接备份密钥文件。");
     }
 
     #[test]

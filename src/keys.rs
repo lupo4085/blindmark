@@ -1,6 +1,7 @@
 //! Key-derived material: pattern, payload encryption, CRC.
 //! Byte-exact with the Python reference implementation (format "blindmark/v1").
 
+use bip39::{Language, Mnemonic};
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::{Digest, Sha256};
 
@@ -182,6 +183,71 @@ pub fn parse_key_file(text: &str) -> anyhow::Result<Vec<u8>> {
     Ok(k)
 }
 
+#[derive(Debug, PartialEq)]
+pub enum WordsError {
+    WrongLength(usize),        // 密钥不是 32 字节，无法用助记词表示
+    WordCount(usize),          // 输入的词数不是 24
+    UnknownWord(usize, String),// 第几个词（从 1 开始）、原词
+    Checksum,                  // 词都认识，但校验对不上（通常是顺序错了或抄错了一个词）
+}
+
+pub fn key_to_words(key: &[u8]) -> Result<Vec<String>, WordsError> {
+    if key.len() != 32 {
+        return Err(WordsError::WrongLength(key.len()));
+    }
+    let m = Mnemonic::from_entropy_in(Language::English, key).map_err(|_| WordsError::WrongLength(key.len()))?;
+    Ok(m.words().map(str::to_string).collect())
+}
+
+pub fn key_from_words(text: &str) -> Result<[u8; 32], WordsError> {
+    let lower = text.to_lowercase();
+    let mut words: Vec<String> = Vec::new();
+    for token in lower.split_whitespace() {
+        let (digits, rest) = token.split_at(token.len() - token.trim_start_matches(|c: char| c.is_ascii_digit()).len());
+        let word = if digits.is_empty() {
+            token
+        } else if let Some(r) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')).or_else(|| rest.strip_prefix('、')) {
+            r
+        } else {
+            token
+        };
+        if !word.is_empty() {
+            words.push(word.to_string());
+        }
+    }
+    if words.len() != 24 {
+        return Err(WordsError::WordCount(words.len()));
+    }
+    for (i, w) in words.iter().enumerate() {
+        if Language::English.find_word(w).is_none() {
+            return Err(WordsError::UnknownWord(i + 1, w.clone()));
+        }
+    }
+    let joined = words.join(" ");
+    let m = Mnemonic::parse_in_normalized(Language::English, &joined).map_err(|_| WordsError::Checksum)?;
+    let entropy = m.to_entropy();
+    entropy.as_slice().try_into().map_err(|_| WordsError::Checksum)
+}
+
+/// 按下面的规范化规则数词，给界面的实时计数用。
+pub fn count_words(text: &str) -> usize {
+    let lower = text.to_lowercase();
+    lower
+        .split_whitespace()
+        .map(|token| {
+            let (digits, rest) = token.split_at(token.len() - token.trim_start_matches(|c: char| c.is_ascii_digit()).len());
+            if digits.is_empty() {
+                token
+            } else if let Some(r) = rest.strip_prefix('.').or_else(|| rest.strip_prefix(')')).or_else(|| rest.strip_prefix('、')) {
+                r
+            } else {
+                token
+            }
+        })
+        .filter(|w| !w.is_empty())
+        .count()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,5 +266,72 @@ mod tests {
         for id in [0u32, 1, 0xdeadbeef, u32::MAX] {
             assert_eq!(decode_payload(&key, &encode_payload(&key, id)), (id, true));
         }
+    }
+
+    const FIXED_WORDS: &str = "abandon amount liar amount expire adjust cage candy arch gather drum bullet absurd math era live bid rhythm alien crouch range attend journey unaware";
+
+    #[test]
+    fn words_match_fixed_vector() {
+        let key: Vec<u8> = (0u8..32).collect();
+        let words = key_to_words(&key).unwrap();
+        assert_eq!(words.len(), 24);
+        assert_eq!(words.join(" "), FIXED_WORDS);
+        let back = key_from_words(FIXED_WORDS).unwrap();
+        assert_eq!(&back[..], &key[..]);
+    }
+
+    #[test]
+    fn words_round_trip_100_keys() {
+        for _ in 0..100 {
+            let key = generate_key().unwrap();
+            let words = key_to_words(&key).unwrap();
+            let numbered: String =
+                words.iter().enumerate().map(|(i, w)| format!("{}. {}", i + 1, w)).collect::<Vec<_>>().join("\n");
+            assert_eq!(key_from_words(&numbered).unwrap(), key);
+        }
+    }
+
+    #[test]
+    fn words_accept_normalized_input() {
+        let expected = key_from_words(FIXED_WORDS).unwrap();
+        let upper = FIXED_WORDS.to_uppercase();
+        assert_eq!(key_from_words(&upper).unwrap(), expected);
+        let spaced = FIXED_WORDS.replace(' ', "   \r\n\t  ");
+        assert_eq!(key_from_words(&spaced).unwrap(), expected);
+        let fullwidth = FIXED_WORDS.replace(' ', "\u{3000}");
+        assert_eq!(key_from_words(&fullwidth).unwrap(), expected);
+        let words: Vec<&str> = FIXED_WORDS.split(' ').collect();
+        let dot: String = words.iter().enumerate().map(|(i, w)| format!("{}. {}", i + 1, w)).collect::<Vec<_>>().join("\n");
+        assert_eq!(key_from_words(&dot).unwrap(), expected);
+        let paren: String = words.iter().enumerate().map(|(i, w)| format!("{}) {}", i + 1, w)).collect::<Vec<_>>().join("\n");
+        assert_eq!(key_from_words(&paren).unwrap(), expected);
+        let ideographic: String = words.iter().enumerate().map(|(i, w)| format!("{}、{}", i + 1, w)).collect::<Vec<_>>().join("\n");
+        assert_eq!(key_from_words(&ideographic).unwrap(), expected);
+    }
+
+    #[test]
+    fn words_count_uses_normalization() {
+        assert_eq!(count_words(FIXED_WORDS), 24);
+        assert_eq!(count_words(""), 0);
+        assert_eq!(count_words(&FIXED_WORDS.replace(' ', "\u{3000}")), 24);
+        let words: Vec<&str> = FIXED_WORDS.split(' ').collect();
+        let dot: String = words[..23].iter().enumerate().map(|(i, w)| format!("{}. {}", i + 1, w)).collect::<Vec<_>>().join("\n");
+        assert_eq!(count_words(&dot), 23);
+        let ideographic: String = words.iter().enumerate().map(|(i, w)| format!("{}、{}", i + 1, w)).collect::<Vec<_>>().join(" ");
+        assert_eq!(count_words(&ideographic), 24);
+    }
+
+    #[test]
+    fn words_reject_bad_input() {
+        let key: Vec<u8> = (0u8..32).collect();
+        let mut words = key_to_words(&key).unwrap();
+        words.swap(0, 1);
+        assert_eq!(key_from_words(&words.join(" ")), Err(WordsError::Checksum));
+        words.swap(0, 1);
+        words[0] = "abandom".into();
+        assert_eq!(key_from_words(&words.join(" ")), Err(WordsError::UnknownWord(1, "abandom".into())));
+        let short = key_to_words(&key).unwrap()[..23].join(" ");
+        assert_eq!(key_from_words(&short), Err(WordsError::WordCount(23)));
+        assert_eq!(key_to_words(&key[..16]), Err(WordsError::WrongLength(16)));
     }
 }
