@@ -40,6 +40,7 @@ Left: original. Middle: watermarked (PSNR 42.8 dB; no pixel changes by more than
 - [Desktop app · 图形界面](#desktop-app--图形界面)
 - [Command line · 命令行](#command-line--命令行)
 - [Benchmarks · 评测结果](#benchmarks--评测结果)
+- [Reliability · 可靠性](#reliability--可靠性)
 - [How it works · 原理](#how-it-works--原理)
 - [Limitations · 局限](#limitations--局限)
 - [Roadmap · 路线图](#roadmap--路线图)
@@ -261,6 +262,31 @@ Simulated tests on 9 photos. The sample is small; treat the numbers as indicativ
 - **Picture consistency · 画面一致性：** genuine detections score above 0.78 (median 0.99); a transplanted watermark scores below 0.01.<br>正常检出的图在 0.78 以上，中位数 0.99；把水印移植到别的图上，结果低于 0.01。
 - **Speed · 速度：** about 1.5 s to watermark a 24-megapixel photo; 1–2 s to detect, 3–4 s with rotation correction (dual-core machine).<br>2400 万像素的照片加水印约 1.5 秒；检测 1–2 秒，需要旋转校正时 3–4 秒（双核机器）。
 
+## Reliability · 可靠性
+
+Calibrated on 523 images that were never watermarked (photos, illustrations, screenshots, synthetic images) and 40 watermarked ones. All images were at most 1600 pixels on the long side. Full method and confidence intervals: [docs/statistics.md](docs/statistics.md).
+
+在 523 张从未加过水印的图片（照片、插画、截图、合成图）和 40 张加了水印的图片上做了标定，所有图片长边不超过 1600 像素。完整方法和置信区间见 [docs/statistics.md](docs/statistics.md)。
+
+| Measure · 指标 | Result · 结果 |
+|---|---|
+| Unwatermarked image reported as "this is your image"<br>把没加水印的图误判为“这是你的图片” | **0 in 15,690 checks.** Estimated below 1 in a million per check (model estimate ≤ 5×10⁻⁸).<br>**15,690 次检测 0 次。** 估计每次检测低于百万分之一（模型估计 ≤ 5×10⁻⁸）。 |
+| "Your watermark may be present" hint on an unwatermarked image<br>在没加水印的图上提示“可能有你的水印” | **0 in 15,480 checks** (estimated about 4 in a million).<br>**15,480 次检测 0 次**（估计约百万分之四）。 |
+| Wrong ID returned<br>认错编号 | **0 in 130 detections.**<br>**130 次识别 0 次。** |
+| Detection after JPEG 75, half size, or cropping away half the area<br>JPEG 75 压缩、缩小一半、裁掉一半面积后的识别率 | **32 / 32 for each** among images that passed the self-check (95% lower bound 89%).<br>通过自检的图片，三种处理**各 32 / 32**（95% 置信下界 89%）。 |
+
+The highest score on any unwatermarked image was 6.99; the lowest on any detected watermarked image was 9.56. The two groups did not overlap.
+
+所有未加水印的图里，分数最高为 6.99；所有识别出来的水印图里，分数最低为 9.56，两组没有重叠。
+
+![Score distribution: unwatermarked vs watermarked](docs/images/calib_scores.svg)
+
+**Pictures that cannot hold a watermark · 装不下水印的图片**
+
+8 of the 40 watermarked test images could not be read back even without any change. Most were almost entirely black or white (dark-mode screenshots, text on a white background, a badge on a large black area): in flat areas the watermark must stay invisible, so almost nothing can be changed. Since v0.3, BlindMark re-reads every copy right after saving it and warns you when the watermark is weak or unreadable.
+
+40 张测试图里有 8 张加完水印、不做任何处理就读不出来，大多数几乎全黑或全白（深色模式截图、白底文字、大片黑底上的徽章）。纯色区域为了保持看不出来，几乎改不动像素。从 v0.3 起，BlindMark 每保存一份就立刻读回检查一次，水印偏弱或读不出时会提醒你。
+
 ## How it works · 原理
 
 ```mermaid
@@ -296,6 +322,7 @@ The `blindmark/v1` format is frozen: every future version will read watermarks m
 | Does not survive AI redraws or style transfer. | 不抗 AI 重绘、风格迁移。 |
 | Photos taken of a screen are **not supported** yet. | **暂不支持**对着屏幕拍摄的照片。 |
 | Small images shrunk heavily cannot be read (see the live test). | 很小的图在被大幅缩小后读不出来（见上面的实测）。 |
+| Pictures that are mostly pure black or pure white (e.g. dark-mode screenshots) cannot hold a watermark. BlindMark warns you when this happens. | 大面积纯黑或纯白的图片（比如深色模式截图）装不下水印，遇到时 BlindMark 会提醒你。 |
 | Very dark images with large flat areas can fail when also stretched or sheared. | 很暗、大片纯色的图片在同时被拉伸或错切时容易失败。 |
 | A watermark is one piece of evidence, not all of it. Keep the original, the registry and the detection results. | 水印是证据之一，不是全部。主张所有权时，要同时保留原图、登记表和检测结果。 |
 
