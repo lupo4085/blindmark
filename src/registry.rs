@@ -298,6 +298,19 @@ pub fn save_image(img: &RgbImageBuf, path: &Path, jpeg_quality: Option<u8>) -> R
     Ok(())
 }
 
+/// Encode the picture as JPEG in memory and decode it again.
+pub fn jpeg_roundtrip(img: &RgbImageBuf, quality: u8) -> Result<RgbImageBuf> {
+    let mut buf = Vec::new();
+    {
+        let mut cur = std::io::Cursor::new(&mut buf);
+        let mut enc = image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cur, quality);
+        enc.encode(&img.data, img.w as u32, img.h as u32, image::ExtendedColorType::Rgb8)
+            .context("jpeg encode")?;
+    }
+    let dynimg = image::load_from_memory(&buf).context("jpeg decode")?;
+    Ok(from_dynamic(dynimg))
+}
+
 pub fn thumbnail(img: &RgbImageBuf, side: usize) -> RgbImageBuf {
     let s = side as f64 / img.w.max(img.h) as f64;
     if s >= 1.0 {

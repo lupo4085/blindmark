@@ -14,9 +14,40 @@ use anyhow::Result;
 use registry::{load_image, save_image, Registry, RgbImageBuf};
 use std::path::Path;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum EmbedCheck {
+    /// Readable from the saved file and after a JPEG-75 round trip.
+    Ok,
+    /// Readable from the saved file, but not after JPEG-75: likely lost when re-compressed or screenshotted.
+    Weak,
+    /// Not readable even from the saved file: the picture is too flat (large pure black / white areas).
+    Unreadable,
+}
+
 pub struct EmbedResult {
     pub id: u32,
     pub psnr: f64,
+    pub check: EmbedCheck,
+}
+
+/// Re-detect a freshly saved watermarked file. `id` is the ID just embedded.
+pub fn check_embedded(saved: &Path, key: &[u8], id: u32) -> Result<EmbedCheck> {
+    let saved_img = load_image(saved)?;
+    let known = wm::KnownIds::new(key, vec![id]);
+    let y = imgproc::luma(&saved_img.data, saved_img.w, saved_img.h);
+    let det = wm::detect_luma(&y, key, Some(&known), wm::Z_THRESH);
+    if !det.found || det.image_id != Some(id) {
+        return Ok(EmbedCheck::Unreadable);
+    }
+    let rt = registry::jpeg_roundtrip(&saved_img, 75)?;
+    let y_rt = imgproc::luma(&rt.data, rt.w, rt.h);
+    let det_rt = wm::detect_luma(&y_rt, key, Some(&known), wm::Z_THRESH);
+    if det_rt.found && det_rt.image_id == Some(id) {
+        Ok(EmbedCheck::Ok)
+    } else {
+        Ok(EmbedCheck::Weak)
+    }
 }
 
 /// Load -> embed -> save -> register. Used by both the GUI and the CLI.
@@ -41,6 +72,7 @@ pub fn embed_file(
         use sha2::Digest as _;
         hex::encode(sha2::Sha256::digest(std::fs::read(output)?))
     };
+    let check = check_embedded(output, key, id).unwrap_or(EmbedCheck::Unreadable);
     let src = input.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let meta = registry::CopyMeta { sha256_file: Some(sha256_file), ..Default::default() };
     reg.register_full(
@@ -53,7 +85,7 @@ pub fn embed_file(
         Some(output.display().to_string()),
         Some(&meta),
     )?;
-    Ok(EmbedResult { id, psnr })
+    Ok(EmbedResult { id, psnr, check })
 }
 
 /// `dir/stem{suffix}.{ext}`, adding 2, 3, ... until the name is free.
@@ -164,4 +196,98 @@ pub fn detect_image_opts(
         rep.geometry = Some("feature-homography".into());
     }
     rep
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("blindmark-lib-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn key() -> [u8; 32] {
+        crate::keys::generate_key().unwrap()
+    }
+
+    /// 720×1600, almost all black. The bottom 60 rows carry noise so `too_flat` does not
+    /// reject the picture before the watermark is considered.
+    fn black_screenshot(path: &Path) {
+        let (w, h) = (720usize, 1600usize);
+        let mut data = vec![0u8; w * h * 3];
+        let mut s: u32 = 0x9e37_79b9;
+        for y in (h - 60)..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (s >> 24) as u8;
+                let i = (y * w + x) * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        image::save_buffer(path, &data, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
+    }
+
+    /// 800×600 gradient plus noise, never a flat colour.
+    fn textured(path: &Path) {
+        let (w, h) = (800usize, 600usize);
+        let mut s: u32 = 0x1234_5678;
+        let mut data = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = (s >> 24) as f32 / 255.0 * 40.0;
+                let v = 110.0 + 60.0 * ((x as f32 * 0.03).sin() * (y as f32 * 0.04).cos()) + n;
+                let i = (y * w + x) * 3;
+                for c in 0..3 {
+                    data[i + c] = (v + c as f32 * 9.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        image::save_buffer(path, &data, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
+    }
+
+    #[test]
+    fn flat_screenshot_is_unreadable() {
+        let base = tmp("flat");
+        let input = base.join("black.png");
+        black_screenshot(&input);
+        let mut reg = Registry::open(&base.join("registry")).unwrap();
+        let out = base.join("black_wm.png");
+        let k = key();
+        let r = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, None).unwrap();
+        assert_eq!(r.check, EmbedCheck::Unreadable);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn textured_png_is_ok() {
+        let base = tmp("textured-png");
+        let input = base.join("textured.png");
+        textured(&input);
+        let mut reg = Registry::open(&base.join("registry")).unwrap();
+        let out = base.join("textured_wm.png");
+        let k = key();
+        let r = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, None).unwrap();
+        assert_eq!(r.check, EmbedCheck::Ok);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn textured_jpeg95_is_not_unreadable() {
+        let base = tmp("textured-jpeg");
+        let input = base.join("textured.png");
+        textured(&input);
+        let mut reg = Registry::open(&base.join("registry")).unwrap();
+        let out = base.join("textured_wm.jpg");
+        let k = key();
+        let r = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, Some(95)).unwrap();
+        assert!(matches!(r.check, EmbedCheck::Ok | EmbedCheck::Weak), "{:?}", r.check);
+        let _ = std::fs::remove_dir_all(&base);
+    }
 }

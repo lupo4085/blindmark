@@ -45,6 +45,8 @@ pub struct ManifestCopy {
     pub recipient_name: Option<String>,
     pub source: String,
     pub sha256_file: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub check: Option<crate::EmbedCheck>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -689,6 +691,7 @@ mod tests {
                 recipient_name: Some("张三".into()),
                 source: "a.png".into(),
                 sha256_file: "00".repeat(32),
+                check: None,
             }],
         }
     }
@@ -698,6 +701,27 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
         std::fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    /// Manifests written before V3-6c have no `check` field.
+    #[test]
+    fn manifest_without_check_still_deserializes() {
+        let json = r#"{
+            "format": "blindmark/batch/v1",
+            "batch_id": "b_old",
+            "created_utc": "2026-11-09T18:00:00Z",
+            "key_fingerprint": "abcdef",
+            "copies": [{
+                "id": "0x00000001",
+                "recipient_id": "r_0001",
+                "recipient_name": "张三",
+                "source": "a.png",
+                "sha256_file": "0000000000000000000000000000000000000000000000000000000000000000"
+            }]
+        }"#;
+        let m: Manifest = serde_json::from_str(json).unwrap();
+        assert_eq!(m.batch_id, "b_old");
+        assert!(m.copies[0].check.is_none());
     }
 
     fn rm(dir: &Path) {

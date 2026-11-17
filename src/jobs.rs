@@ -205,6 +205,7 @@ pub struct EmbedOk {
     pub id: u32,
     pub psnr: f64,
     pub output: PathBuf,
+    pub check: crate::EmbedCheck,
 }
 
 #[derive(Clone, Debug)]
@@ -283,7 +284,7 @@ pub fn run_embed(
         let output = crate::unique_output_path(&out_dir, path, &job.suffix, job.jpeg_quality.is_some());
         let result = match std::fs::File::open(path) {
             Ok(_) => crate::embed_file(path, &output, key, &mut reg, job.strength, job.channel.clone(), job.jpeg_quality)
-                .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone() })
+                .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone(), check: r.check })
                 .map_err(|e| classify(&e, &name, &out_dir)),
             Err(e) => Err(UserError {
                 message: format!("无法打开 {name}：文件可能已损坏，或者不是支持的图片格式。"),
@@ -325,6 +326,7 @@ pub struct DistItemOk {
     pub id: u32,
     pub output: PathBuf,
     pub sha256_file: String,
+    pub check: crate::EmbedCheck,
 }
 
 #[derive(Clone, Debug)]
@@ -441,6 +443,7 @@ pub fn run_distribute(
                         id: copy.id,
                         output: copy.path.clone(),
                         sha256_file: copy.sha256_file.clone(),
+                        check: copy.check,
                     }),
                 }),
                 Err(e) => on_event(DistEvent::Item {

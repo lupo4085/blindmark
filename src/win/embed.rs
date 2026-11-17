@@ -466,7 +466,7 @@ pub fn on_item(a: &mut App, row: usize, res: Result<EmbedOk, UserError>) {
     a.embed.run_done += 1;
     match res {
         Ok(ok) => {
-            let EmbedOk { id, psnr, output: out } = ok;
+            let EmbedOk { id, psnr, output: out, .. } = ok;
             a.embed.run_ok += 1;
             if let Some(d) = out.parent() {
                 if !a.embed.run_dirs.iter().any(|x| x == d) {
