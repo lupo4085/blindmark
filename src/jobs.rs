@@ -179,6 +179,12 @@ pub struct EmbedSummary {
 fn classify(e: &anyhow::Error, name: &str, out_dir: &Path) -> UserError {
     let detail = format!("{e:#}");
     for cause in e.chain() {
+        if cause.downcast_ref::<distribute::UnreadableImage>().is_some() {
+            return UserError {
+                message: format!("无法打开 {name}：文件可能已损坏，或者不是支持的图片格式。"),
+                detail,
+            };
+        }
         if let Some(ie) = cause.downcast_ref::<image::ImageError>() {
             if matches!(ie, image::ImageError::Decoding(_) | image::ImageError::Unsupported(_)) {
                 return UserError {
@@ -273,6 +279,7 @@ pub enum DistEvent {
 pub struct DistItemOk {
     pub id: u32,
     pub output: PathBuf,
+    pub sha256_file: String,
 }
 
 #[derive(Clone, Debug)]
@@ -370,9 +377,7 @@ pub fn run_distribute(
         batch_id: batch_id.clone(),
         tsa: job.tsa.clone(),
     };
-    let tsa_requested = job.tsa.is_some();
-    let (mut done, mut ok) = (0usize, 0usize);
-    let mut stamping_sent = false;
+    let mut done = 0usize;
     let outcome = distribute::distribute(&job.files, &targets, key, &mut reg, &opts, cancel, &mut |progress| match progress {
         DistProgress::Start { file_index, target } => on_event(DistEvent::Running {
             done,
@@ -383,15 +388,16 @@ pub fn run_distribute(
         DistProgress::Done { file_index, target, result } => {
             done += 1;
             match result {
-                Ok(copy) => {
-                    ok += 1;
-                    on_event(DistEvent::Item {
-                        file_index,
-                        recipient_id: copy.recipient_id.clone(),
-                        recipient: target.name.clone(),
-                        result: Ok(DistItemOk { id: copy.id, output: copy.path.clone() }),
-                    });
-                }
+                Ok(copy) => on_event(DistEvent::Item {
+                    file_index,
+                    recipient_id: copy.recipient_id.clone(),
+                    recipient: target.name.clone(),
+                    result: Ok(DistItemOk {
+                        id: copy.id,
+                        output: copy.path.clone(),
+                        sha256_file: copy.sha256_file.clone(),
+                    }),
+                }),
                 Err(e) => on_event(DistEvent::Item {
                     file_index,
                     recipient_id: target.id.clone(),
@@ -399,11 +405,8 @@ pub fn run_distribute(
                     result: Err(classify(e, &file_name(&job.files[file_index]), &job.out_root)),
                 }),
             }
-            if tsa_requested && !stamping_sent && ok > 0 && (done == total || cancel.load(Ordering::SeqCst)) {
-                stamping_sent = true;
-                on_event(DistEvent::Stamping);
-            }
         }
+        DistProgress::Stamping => on_event(DistEvent::Stamping),
     });
 
     let mut recipients = std::collections::HashSet::new();
@@ -795,6 +798,32 @@ mod tests {
         assert_eq!((summary.ok, summary.failed, summary.recipients), (2, 0, 2));
         assert!(summary.batch_id.starts_with("b_"));
         assert!(summary.stamp.is_none());
+    }
+
+    #[test]
+    fn distribute_bad_image_says_it_cannot_be_opened() {
+        let base = tmp("distribute-bad-image");
+        let regdir = base.join("registry");
+        let ids = book_with(&regdir, &["张三", "李四", "王五"]);
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let bad = input.join("bad.png");
+        std::fs::write(&bad, b"not a png").unwrap();
+        let job = dist_job(vec![bad], ids, base.join("out"));
+        let cancel = AtomicBool::new(false);
+        let mut messages = vec![];
+        let summary = run_distribute(&job, &key(), &regdir, &cancel, &mut |ev| {
+            if let DistEvent::Item { result: Err(e), .. } = ev {
+                messages.push(e.message);
+            }
+        })
+        .unwrap();
+        assert_eq!(summary.failed, 3);
+        assert_eq!(messages.len(), 3);
+        assert!(
+            messages.iter().all(|m| m.starts_with("无法打开 bad.png：文件可能已损坏，或者不是支持的图片格式。")),
+            "{messages:?}"
+        );
     }
 
     #[test]

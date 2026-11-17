@@ -43,11 +43,26 @@ pub struct CopyOk {
     pub sha256_file: String,
 }
 
-/// One copy about to start, or just finished.
+/// One copy about to start, or just finished, or the timestamp request starting.
 pub enum DistProgress<'a> {
     Start { file_index: usize, target: &'a Target },
     Done { file_index: usize, target: &'a Target, result: &'a Result<CopyOk, anyhow::Error> },
+    Stamping,
 }
+
+/// An input image that could not be read; every copy of it fails with this.
+#[derive(Debug)]
+pub struct UnreadableImage {
+    pub detail: String,
+}
+
+impl std::fmt::Display for UnreadableImage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+
+impl std::error::Error for UnreadableImage {}
 
 pub struct DistOutcome {
     pub copies: Vec<CopyOk>,
@@ -100,11 +115,17 @@ fn target_names(targets: &[Target]) -> Vec<String> {
     let base: Vec<String> = targets.iter().map(|t| safe_name(&t.name, &t.id)).collect();
     let mut counts: HashMap<String, usize> = HashMap::new();
     for name in &base {
-        *counts.entry(name.clone()).or_default() += 1;
+        *counts.entry(name.to_lowercase()).or_default() += 1;
     }
     base.into_iter()
         .zip(targets)
-        .map(|(name, target)| if counts[&name] > 1 { format!("{name}_{}", target.id) } else { name })
+        .map(|(name, target)| {
+            if counts[&name.to_lowercase()] > 1 {
+                format!("{name}_{}", target.id)
+            } else {
+                name
+            }
+        })
         .collect()
 }
 
@@ -189,9 +210,14 @@ pub fn distribute(
                 let text = format!("{e:#}");
                 for target in targets {
                     on(DistProgress::Start { file_index, target });
-                    let result: Result<CopyOk> = Err(anyhow::anyhow!("{text}"));
+                    let result: Result<CopyOk> =
+                        Err(anyhow::Error::new(UnreadableImage { detail: text.clone() }));
                     on(DistProgress::Done { file_index, target, result: &result });
-                    out.failed.push((file_index, target.id.clone(), anyhow::anyhow!("{text}")));
+                    out.failed.push((
+                        file_index,
+                        target.id.clone(),
+                        anyhow::Error::new(UnreadableImage { detail: text.clone() }),
+                    ));
                 }
                 continue 'files;
             }
@@ -229,6 +255,7 @@ pub fn distribute(
                 key_fingerprint: crate::keys::fingerprint(key),
                 copies: manifest_copies,
             };
+            on(DistProgress::Stamping);
             out.stamp = Some(timestamp::stamp_batch(&reg.dir, &manifest, url));
         }
     }
@@ -312,6 +339,7 @@ mod tests {
         let outcome = distribute(&files, &targets, &key(), &mut reg, &o, &cancel, &mut |p| match p {
             DistProgress::Start { .. } => starts += 1,
             DistProgress::Done { .. } => dones += 1,
+            DistProgress::Stamping => {}
         });
 
         assert!(!outcome.cancelled);
@@ -420,6 +448,32 @@ mod tests {
     }
 
     #[test]
+    fn names_differing_only_in_case_get_distinct_folders() {
+        let base = tmp("case-names");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let file = input.join("a.png");
+        textured_png(&file);
+        let targets = vec![target("r_0000000c", "Alice"), target("r_0000000d", "alice")];
+        let regdir = base.join("registry");
+        let mut reg = Registry::open(&regdir).unwrap();
+        let o = opts(base.join("out"), "b_test_case");
+        let cancel = AtomicBool::new(false);
+        let outcome = distribute(&[file], &targets, &key(), &mut reg, &o, &cancel, &mut |_| {});
+
+        assert_eq!(outcome.copies.len(), 2);
+        let dirs: Vec<String> = outcome
+            .copies
+            .iter()
+            .map(|c| c.path.parent().unwrap().file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_ne!(dirs[0], dirs[1]);
+        assert!(dirs[0].ends_with("r_0000000c"), "{}", dirs[0]);
+        assert!(dirs[1].ends_with("r_0000000d"), "{}", dirs[1]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn no_timestamp_without_tsa() {
         let base = tmp("no-tsa");
         let input = base.join("in");
@@ -431,9 +485,15 @@ mod tests {
         let mut reg = Registry::open(&regdir).unwrap();
         let o = opts(base.join("out"), "b_test_5");
         let cancel = AtomicBool::new(false);
-        let outcome = distribute(&[file], &targets, &key(), &mut reg, &o, &cancel, &mut |_| {});
+        let mut stamping = 0;
+        let outcome = distribute(&[file], &targets, &key(), &mut reg, &o, &cancel, &mut |p| {
+            if let DistProgress::Stamping = p {
+                stamping += 1;
+            }
+        });
 
         assert!(outcome.stamp.is_none());
+        assert_eq!(stamping, 0, "no timestamp request means no Stamping event");
         assert!(!regdir.join("timestamps").exists());
         let _ = std::fs::remove_dir_all(&base);
     }

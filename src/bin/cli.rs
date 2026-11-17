@@ -157,10 +157,7 @@ fn read_key(p: &PathBuf) -> Result<Vec<u8>> {
     keys::parse_key_file(&std::fs::read_to_string(p).with_context(|| format!("cannot read key {}", p.display()))?)
 }
 
-fn hash_file(path: &PathBuf) -> String {
-    use sha2::Digest as _;
-    hex::encode(sha2::Sha256::digest(std::fs::read(path).unwrap_or_default()))
-}
+
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -199,31 +196,25 @@ fn main() -> Result<()> {
                     tsa: timestamp.then(|| tsa.clone()),
                 };
                 let cancel = std::sync::atomic::AtomicBool::new(false);
-                let mut rows: Vec<(u32, String, String, PathBuf)> = Vec::new();
+                let mut rows = Vec::new();
                 let summary = run_distribute(&job, &k, &registry, &cancel, &mut |ev| match ev {
                     DistEvent::Running { .. } | DistEvent::Stamping => {}
                     DistEvent::Item { recipient_id, recipient, result: Ok(ok), .. } => {
-                        rows.push((ok.id, recipient_id, recipient, ok.output))
+                        rows.push((ok, recipient_id, recipient))
                     }
                     DistEvent::Item { result: Err(e), .. } => eprintln!("{}", e.message),
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
-                let reg = Registry::open(&registry).ok();
-                for (id, recipient_id, recipient, output) in rows {
-                    let sha256_file = reg
-                        .as_ref()
-                        .and_then(|r| r.get(id))
-                        .and_then(|e| e.sha256_file.clone())
-                        .unwrap_or_else(|| hash_file(&output));
+                for (ok, recipient_id, recipient) in rows {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "id": format!("0x{id:08x}"),
+                            "id": format!("0x{:08x}", ok.id),
                             "recipient": recipient,
                             "recipient_id": recipient_id,
-                            "output": output,
-                            "sha256_file": sha256_file,
+                            "output": ok.output,
+                            "sha256_file": ok.sha256_file,
                         })
                     );
                 }
