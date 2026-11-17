@@ -1,6 +1,6 @@
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use blindmark::distribute::{distribute, DistOpts, Target};
-use blindmark::recipients::Book;
+use blindmark::recipients::{Book, GroupFilter};
 use blindmark::{keys, registry::Registry, wm};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -71,9 +71,21 @@ enum Cmd {
 
 #[derive(Subcommand)]
 enum RecCmd {
+    /// List recipients
+    List {
+        /// Only this group (a top-level group also lists its subgroups)
+        #[arg(long)]
+        group: Option<String>,
+        /// Include archived recipients
+        #[arg(long)]
+        archived: bool,
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+    },
     /// Add a recipient
     Add {
         name: String,
+        /// Group id
         #[arg(long)]
         group: Option<String>,
         #[arg(long)]
@@ -81,7 +93,28 @@ enum RecCmd {
         #[arg(long, default_value = "registry")]
         registry: PathBuf,
     },
-    /// Add a group (two levels: --parent takes a group name)
+    /// Edit a recipient
+    Edit {
+        id: String,
+        #[arg(long)]
+        name: Option<String>,
+        /// Group id, or `none` to remove the recipient from its group
+        #[arg(long)]
+        group: Option<String>,
+        #[arg(long)]
+        note: Option<String>,
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+    },
+    /// Archive a recipient; --undo restores it
+    Archive {
+        id: String,
+        #[arg(long)]
+        undo: bool,
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+    },
+    /// Add a group (two levels: --parent takes a group id)
     Group {
         name: String,
         #[arg(long)]
@@ -89,8 +122,10 @@ enum RecCmd {
         #[arg(long, default_value = "registry")]
         registry: PathBuf,
     },
-    /// List groups and recipients
-    List {
+    /// Rename a group
+    RenameGroup {
+        id: String,
+        name: String,
         #[arg(long, default_value = "registry")]
         registry: PathBuf,
     },
@@ -216,27 +251,50 @@ fn main() -> Result<()> {
             }
         }
         Cmd::Recipients { cmd } => match cmd {
+            RecCmd::List { group, archived, registry } => {
+                let book = Book::open(&registry)?;
+                let filter = match group.as_deref() {
+                    Some(id) => GroupFilter::Group(id),
+                    None => GroupFilter::All,
+                };
+                for r in book.list(filter, archived) {
+                    let g = r.group_id.as_deref().map(|g| book.group_path(g)).unwrap_or_else(|| "未分组".into());
+                    let archived_mark = if r.archived { "\t已归档" } else { "" };
+                    println!("{}\t{}\t{}\t{}{}", r.id, r.name, g, r.note, archived_mark);
+                }
+            }
             RecCmd::Add { name, group, note, registry } => {
                 let mut book = Book::open(&registry)?;
-                let gid = group.as_deref().and_then(|g| book.groups.iter().find(|x| x.name == g).map(|x| x.id.clone()));
-                let r = book.add_recipient(&name, gid.as_deref(), note.as_deref().unwrap_or(""))?;
+                let r = book.add_recipient(&name, group.as_deref(), note.as_deref().unwrap_or(""))?;
                 println!("{}", serde_json::json!({"id": r.id, "name": r.name, "group": r.group_id}));
+            }
+            RecCmd::Edit { id, name, group, note, registry } => {
+                let mut book = Book::open(&registry)?;
+                let cur = match book.recipient(&id) {
+                    Some(r) => r.clone(),
+                    None => bail!("找不到这位接收人，可能已经被修改，请重新打开。"),
+                };
+                let new_name = name.as_deref().unwrap_or(&cur.name);
+                let new_group = match group.as_deref() {
+                    Some("none") => None,
+                    Some(g) => Some(g.to_string()),
+                    None => cur.group_id.clone(),
+                };
+                let new_note = note.as_deref().unwrap_or(&cur.note);
+                book.update_recipient(&id, new_name, new_group.as_deref(), new_note)?;
+            }
+            RecCmd::Archive { id, undo, registry } => {
+                let mut book = Book::open(&registry)?;
+                book.set_archived(&id, !undo)?;
             }
             RecCmd::Group { name, parent, registry } => {
                 let mut book = Book::open(&registry)?;
-                let pid = parent.as_deref().and_then(|p| book.groups.iter().find(|g| g.name == p).map(|g| g.id.clone()));
-                let g = book.add_group(&name, pid.as_deref())?;
+                let g = book.add_group(&name, parent.as_deref())?;
                 println!("{}", serde_json::json!({"id": g.id, "name": g.name, "parent": g.parent}));
             }
-            RecCmd::List { registry } => {
-                let book = Book::open(&registry)?;
-                for g in &book.groups {
-                    println!("[group] {} ({}) parent={:?}", g.name, g.id, g.parent);
-                }
-                for r in &book.items {
-                    let g = r.group_id.as_deref().map(|g| book.group_path(g)).unwrap_or_else(|| "未分组".into());
-                    println!("[recipient] {} ({}) group={} note={}", r.name, r.id, g, r.note);
-                }
+            RecCmd::RenameGroup { id, name, registry } => {
+                let mut book = Book::open(&registry)?;
+                book.rename_group(&id, &name)?;
             }
         },
         Cmd::Stamp { cmd } => match cmd {

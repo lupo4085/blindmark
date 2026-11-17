@@ -3,7 +3,7 @@
 //! Samples live in `tests/golden/` and are never regenerated to make a test pass — see
 //! `tests/golden/README.md`.
 
-use blindmark::recipients::Book;
+use blindmark::recipients::{Book, GroupFilter};
 use blindmark::registry::{self, Registry};
 use blindmark::wm;
 use blindmark::{detect_image_opts, DetectOptions};
@@ -100,7 +100,8 @@ fn recipients_v1_loads() {
     assert_eq!(book.group_path("g_0002"), "客户 / 2026 秋季");
     assert!(book.recipient("r_0001").is_some(), "old recipient id r_0001 not found");
     assert!(book.recipient("r_0002").is_some(), "old recipient id r_0002 not found");
-    assert_eq!(book.recipients_in(Some("g_0002")).len(), 2);
+    assert_eq!(book.list(GroupFilter::Group("g_0002"), false).len(), 2);
+    assert_eq!(book.list(GroupFilter::Group("g_0001"), false).len(), 2, "parent group must include its subgroup's recipients");
 }
 
 /// Second line of defence for the format: the same Python vectors as `src/keys.rs`.
