@@ -16,7 +16,7 @@ py=''
 for c in python3 python; do
     if command -v "$c" >/dev/null 2>&1; then py="$c"; break; fi
 done
-if [ -n "$py" ] && "$py" -c 'import cv2, numpy' >/dev/null 2>&1; then
+if [ -n "$py" ] && "$py" -c 'import cv2, numpy, PIL' >/dev/null 2>&1; then
     keyfile="$(mktemp)"
     trap 'rm -f "$keyfile"' EXIT
     printf '%s' "$(printf '%02x' {0..31})" > "$keyfile"

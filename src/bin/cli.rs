@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use blindmark::distribute::{distribute, DistOpts, Target};
+use blindmark::jobs::{run_distribute, DistEvent, DistJob};
 use blindmark::recipients::{Book, GroupFilter};
 use blindmark::{keys, registry::Registry, wm};
 use clap::{Parser, Subcommand};
@@ -82,6 +82,11 @@ enum RecCmd {
         #[arg(long, default_value = "registry")]
         registry: PathBuf,
     },
+    /// List groups in tree order (ID, then the full path of the group)
+    Groups {
+        #[arg(long, default_value = "registry")]
+        registry: PathBuf,
+    },
     /// Add a recipient
     Add {
         name: String,
@@ -152,9 +157,7 @@ fn read_key(p: &PathBuf) -> Result<Vec<u8>> {
     keys::parse_key_file(&std::fs::read_to_string(p).with_context(|| format!("cannot read key {}", p.display()))?)
 }
 
-fn batch_id() -> String {
-    format!("b_{}", chrono::Local::now().format("%Y%m%d_%H%M%S"))
-}
+
 
 fn main() -> Result<()> {
     match Cli::parse().cmd {
@@ -177,42 +180,60 @@ fn main() -> Result<()> {
 
             if let Some(list) = to {
                 let mut book = Book::open(&registry)?;
-                let mut targets = Vec::new();
+                let mut recipient_ids = Vec::new();
                 for name in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
-                    let r = book.recipient_by_name_or_create(name)?;
-                    let group_name = r.group_id.as_deref().map(|g| book.group_path(g));
-                    targets.push(Target { id: r.id, name: r.name, group_id: r.group_id, group_name });
+                    recipient_ids.push(book.recipient_by_name_or_create(name)?.id);
                 }
-                let opts = DistOpts {
-                    root: out,
-                    suffix: "_wm".into(),
-                    jpeg_quality: jpeg.then_some(95),
-                    strength,
+                drop(book);
+                let job = DistJob {
+                    files: inputs,
+                    recipient_ids,
+                    out_root: out,
                     per_recipient_dir: !flat,
-                    batch_id: Some(batch_id()),
+                    suffix: "_wm".into(),
+                    strength,
+                    jpeg_quality: jpeg.then_some(95),
                     tsa: timestamp.then(|| tsa.clone()),
                 };
-                let batch = opts.batch_id.clone();
-                let res = distribute(&inputs, &targets, &k, &mut reg, &opts)?;
-                if let Some(st) = &res.stamp {
-                    if st.record.ok {
-                        eprintln!("timestamp ok: {} ({})", st.dir.display(), st.record.gen_time_utc.as_deref().unwrap_or(""));
-                    } else {
-                        eprintln!("timestamp failed: {} — {}", st.dir.display(), stamp_error_kind(&st.record.error));
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let mut rows = Vec::new();
+                let summary = run_distribute(&job, &k, &registry, &cancel, &mut |ev| match ev {
+                    DistEvent::Running { .. } | DistEvent::Stamping => {}
+                    DistEvent::Item { recipient_id, recipient, result: Ok(ok), .. } => {
+                        rows.push((ok, recipient_id, recipient))
                     }
-                }
-                for c in res.copies {
+                    DistEvent::Item { result: Err(e), .. } => eprintln!("{}", e.message),
+                })
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+                for (ok, recipient_id, recipient) in rows {
                     println!(
                         "{}",
                         serde_json::json!({
-                            "recipient": c.recipient,
-                            "output": c.path,
-                            "id": format!("0x{:08x}", c.id),
-                            "psnr_db": (c.psnr * 100.0).round() / 100.0,
-                            "batch": batch,
+                            "id": format!("0x{:08x}", ok.id),
+                            "recipient": recipient,
+                            "recipient_id": recipient_id,
+                            "output": ok.output,
+                            "sha256_file": ok.sha256_file,
                         })
                     );
                 }
+                if let Some(Err(e)) = &summary.stamp {
+                    eprintln!("{}", e.message);
+                }
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": summary.batch_id,
+                        "ok": summary.ok,
+                        "failed": summary.failed,
+                        "stamp": match &summary.stamp {
+                            None => serde_json::Value::Null,
+                            Some(Ok(_)) => serde_json::json!("ok"),
+                            Some(Err(_)) => serde_json::json!("failed"),
+                        },
+                    })
+                );
             } else {
                 for inp in inputs {
                     let stem = inp.file_stem().unwrap_or_default().to_string_lossy();
@@ -261,6 +282,15 @@ fn main() -> Result<()> {
                     let g = r.group_id.as_deref().map(|g| book.group_path(g)).unwrap_or_else(|| "未分组".into());
                     let archived_mark = if r.archived { "\t已归档" } else { "" };
                     println!("{}\t{}\t{}\t{}{}", r.id, r.name, g, r.note, archived_mark);
+                }
+            }
+            RecCmd::Groups { registry } => {
+                let book = Book::open(&registry)?;
+                for (top, subs) in book.groups_tree() {
+                    println!("{}\t{}", top.id, book.group_path(&top.id));
+                    for sub in subs {
+                        println!("{}\t{}", sub.id, book.group_path(&sub.id));
+                    }
                 }
             }
             RecCmd::Add { name, group, note, registry } => {

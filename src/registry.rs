@@ -37,6 +37,9 @@ pub struct Entry {
     pub group_name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub batch_id: Option<String>,
+    /// SHA-256 of the output file as written to disk (hex). Absent for entries made before v0.3.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sha256_file: Option<String>,
 }
 
 /// Recipient facts recorded with a copy.
@@ -47,6 +50,7 @@ pub struct CopyMeta {
     pub group_id: Option<String>,
     pub group_name: Option<String>,
     pub batch_id: Option<String>,
+    pub sha256_file: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -164,6 +168,7 @@ impl Registry {
             group_id: meta.and_then(|m| m.group_id.clone()),
             group_name: meta.and_then(|m| m.group_name.clone()),
             batch_id: meta.and_then(|m| m.batch_id.clone()),
+            sha256_file: meta.and_then(|m| m.sha256_file.clone()),
         };
         self.entries.insert(id.to_string(), e);
         self.save()
