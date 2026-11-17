@@ -9,6 +9,7 @@ use crate::registry::{load_image, save_image, CopyMeta, Registry, RgbImageBuf};
 use crate::timestamp::{self, Manifest, ManifestCopy};
 use crate::unique_output_path;
 use crate::wm;
+use crate::{check_embedded, EmbedCheck};
 
 /// The recipient a copy is addressed to, resolved from the recipient book.
 #[derive(Clone, Debug)]
@@ -41,6 +42,7 @@ pub struct CopyOk {
     pub path: PathBuf,
     pub psnr: f64,
     pub sha256_file: String,
+    pub check: EmbedCheck,
 }
 
 /// One copy about to start, or just finished, or the timestamp request starting.
@@ -161,6 +163,7 @@ fn make_copy(
     let path = unique_output_path(&dir, Path::new(&format!("{stem_out}.png")), &o.suffix, o.jpeg_quality.is_some());
     save_image(&marked, &path, o.jpeg_quality)?;
     let sha256_file = sha256_of_file(&path)?;
+    let check = check_embedded(&path, key, id).unwrap_or(EmbedCheck::Unreadable);
 
     let meta = CopyMeta {
         recipient_id: Some(target.id.clone()),
@@ -181,7 +184,7 @@ fn make_copy(
         Some(&meta),
     )?;
 
-    Ok(CopyOk { file_index, recipient_id: target.id.clone(), id, path, psnr, sha256_file })
+    Ok(CopyOk { file_index, recipient_id: target.id.clone(), id, path, psnr, sha256_file, check })
 }
 
 /// Embed one copy per (file, target). Images are the outer loop, recipients the inner loop.
@@ -238,6 +241,7 @@ pub fn distribute(
                         recipient_name: Some(target.name.clone()),
                         source: file_name(file),
                         sha256_file: copy.sha256_file.clone(),
+                        check: Some(copy.check),
                     });
                     out.copies.push(copy);
                 }

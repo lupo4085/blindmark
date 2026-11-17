@@ -1,7 +1,7 @@
 use anyhow::{bail, Context, Result};
 use blindmark::jobs::{run_distribute, DistEvent, DistJob};
 use blindmark::recipients::{Book, GroupFilter};
-use blindmark::{keys, registry::Registry, wm};
+use blindmark::{keys, registry::Registry, wm, EmbedCheck};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 
@@ -173,6 +173,27 @@ fn read_key(p: &PathBuf) -> Result<Vec<u8>> {
     keys::parse_key_file(&std::fs::read_to_string(p).with_context(|| format!("cannot read key {}", p.display()))?)
 }
 
+fn file_name(path: &std::path::Path) -> String {
+    path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
+}
+
+/// Print the warning for a self-check result; returns (weak, unreadable) counts.
+fn warn_check(name: &str, check: EmbedCheck) -> (usize, usize) {
+    match check {
+        EmbedCheck::Ok => (0, 0),
+        EmbedCheck::Weak => {
+            eprintln!("warning: {name}: watermark is weak and may not survive re-compression or screenshots.");
+            (1, 0)
+        }
+        EmbedCheck::Unreadable => {
+            eprintln!(
+                "warning: {name}: the picture is too flat (large pure black or white areas) to hold a watermark; it could not be read back. Consider not relying on it."
+            );
+            (0, 1)
+        }
+    }
+}
+
 
 
 fn main() -> Result<()> {
@@ -228,6 +249,7 @@ fn main() -> Result<()> {
                 };
                 let cancel = std::sync::atomic::AtomicBool::new(false);
                 let mut rows = Vec::new();
+                let (mut weak, mut unreadable) = (0usize, 0usize);
                 let summary = run_distribute(&job, &k, &registry, &cancel, &mut |ev| match ev {
                     DistEvent::Running { .. } | DistEvent::Stamping => {}
                     DistEvent::Item { recipient_id, recipient, result: Ok(ok), .. } => {
@@ -238,6 +260,10 @@ fn main() -> Result<()> {
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
                 for (ok, recipient_id, recipient) in rows {
+                    let name = file_name(&ok.output);
+                    let (w, u) = warn_check(&name, ok.check);
+                    weak += w;
+                    unreadable += u;
                     println!(
                         "{}",
                         serde_json::json!({
@@ -246,6 +272,7 @@ fn main() -> Result<()> {
                             "recipient_id": recipient_id,
                             "output": ok.output,
                             "sha256_file": ok.sha256_file,
+                            "check": ok.check,
                         })
                     );
                 }
@@ -265,17 +292,30 @@ fn main() -> Result<()> {
                         },
                     })
                 );
+                if weak + unreadable > 0 {
+                    eprintln!("{weak} weak, {unreadable} unreadable");
+                }
             } else {
+                let (mut weak, mut unreadable) = (0usize, 0usize);
                 for inp in inputs {
+                    let name = file_name(&inp);
                     let stem = inp.file_stem().unwrap_or_default().to_string_lossy();
                     let o = out.join(format!("{stem}_wm.{}", if jpeg { "jpg" } else { "png" }));
                     match blindmark::embed_file(&inp, &o, &k, &mut reg, strength, channel.clone(), jpeg.then_some(95)) {
-                        Ok(r) => println!(
-                            "{}",
-                            serde_json::json!({"input": inp, "output": o, "id": format!("0x{:08x}", r.id), "psnr_db": (r.psnr * 100.0).round() / 100.0, "sec": t.elapsed().as_secs_f64()})
-                        ),
+                        Ok(r) => {
+                            let (w, u) = warn_check(&name, r.check);
+                            weak += w;
+                            unreadable += u;
+                            println!(
+                                "{}",
+                                serde_json::json!({"input": inp, "output": o, "id": format!("0x{:08x}", r.id), "psnr_db": (r.psnr * 100.0).round() / 100.0, "check": r.check, "sec": t.elapsed().as_secs_f64()})
+                            );
+                        }
                         Err(e) => eprintln!("{}: {e:#}", inp.display()),
                     }
+                }
+                if weak + unreadable > 0 {
+                    eprintln!("{weak} weak, {unreadable} unreadable");
                 }
             }
         }
