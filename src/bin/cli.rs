@@ -19,6 +19,10 @@ enum Cmd {
         #[arg(long)]
         key: PathBuf,
     },
+    Key {
+        #[command(subcommand)]
+        cmd: KeyCmd,
+    },
     /// Watermark one or more images into an output folder
     Embed {
         inputs: Vec<PathBuf>,
@@ -66,6 +70,18 @@ enum Cmd {
     Stamp {
         #[command(subcommand)]
         cmd: StampCmd,
+    },
+}
+
+#[derive(Subcommand)]
+enum KeyCmd {
+    Words {
+        #[arg(long)]
+        key: PathBuf,
+    },
+    Restore {
+        #[arg(long)]
+        key: PathBuf,
     },
 }
 
@@ -172,6 +188,21 @@ fn main() -> Result<()> {
             }
             println!("wrote {} (fingerprint {}) — back it up, never share it", key.display(), keys::fingerprint(&k));
         }
+        Cmd::Key { cmd } => match cmd {
+            KeyCmd::Words { key } => {
+                let k = read_key(&key)?;
+                let words = blindmark::jobs::key_words(&k).map_err(|e| anyhow::anyhow!(e.message))?;
+                eprintln!("任何人拿到这 24 个词，就等于拿到了你的密钥。请抄在纸上，不要截图或发给别人。");
+                for (i, w) in words.iter().enumerate() {
+                    println!("{}. {}", i + 1, w);
+                }
+            }
+            KeyCmd::Restore { key } => {
+                let text = std::io::read_to_string(std::io::stdin())?;
+                let k = blindmark::jobs::restore_key_file(&text, &key).map_err(|e| anyhow::anyhow!(e.message))?;
+                println!("restored {} (fingerprint {})", key.display(), keys::fingerprint(&k));
+            }
+        },
         Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat, timestamp, tsa } => {
             let k = read_key(&key)?;
             let mut reg = Registry::open(&registry)?;
