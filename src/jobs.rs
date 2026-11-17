@@ -8,8 +8,11 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::distribute::{self, DistOpts, DistProgress, Target};
 use crate::keys;
+use crate::recipients::Book;
 use crate::registry::{Entry, Registry, RgbImageBuf, ThumbIndex};
+use crate::timestamp;
 use crate::wm;
 
 /// A failure as the user should see it: one Chinese sentence plus the raw error.
@@ -246,6 +249,183 @@ pub fn run_embed(
     Ok(summary)
 }
 
+#[derive(Clone, Debug)]
+pub struct DistJob {
+    pub files: Vec<PathBuf>,
+    pub recipient_ids: Vec<String>,
+    pub out_root: PathBuf,
+    pub per_recipient_dir: bool,
+    pub suffix: String,
+    pub strength: f32,
+    pub jpeg_quality: Option<u8>,
+    pub tsa: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DistEvent {
+    Running { done: usize, total: usize, file: String, recipient: String },
+    Item { file_index: usize, recipient_id: String, recipient: String, result: Result<DistItemOk, UserError> },
+    /// Sent once, right before the trusted-timestamp request starts.
+    Stamping,
+}
+
+#[derive(Clone, Debug)]
+pub struct DistItemOk {
+    pub id: u32,
+    pub output: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct DistSummary {
+    pub batch_id: String,
+    pub ok: usize,
+    pub failed: usize,
+    pub cancelled: bool,
+    /// Recipients with at least one successful copy.
+    pub recipients: usize,
+    pub stamp: Option<Result<StampOk, UserError>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct StampOk {
+    pub gen_time_utc: String,
+}
+
+/// A timestamp that was not obtained, in the wording from the task card.
+fn stamp_user_error(error: Option<&timestamp::StampError>) -> UserError {
+    match error {
+        Some(timestamp::StampError::Network { host, detail }) => UserError {
+            message: format!("暂时没能获取时间戳（无法连接 {host}）。副本已经生成，可以稍后重试。"),
+            detail: detail.clone(),
+        },
+        Some(timestamp::StampError::Rejected { status }) => UserError {
+            message: format!("时间戳服务拒绝了这次请求（状态 {status}）。副本已经生成，可以稍后重试。"),
+            detail: format!("status {status}"),
+        },
+        Some(timestamp::StampError::Mismatch { detail }) | Some(timestamp::StampError::Malformed { detail }) => UserError {
+            message: "时间戳服务返回的数据和这次请求对不上，已作废。副本已经生成，可以稍后重试。".into(),
+            detail: detail.clone(),
+        },
+        None => UserError {
+            message: "时间戳服务返回的数据和这次请求对不上，已作废。副本已经生成，可以稍后重试。".into(),
+            detail: "no error was recorded".into(),
+        },
+    }
+}
+
+fn stamp_ok(stamp: timestamp::Stamp) -> Result<StampOk, UserError> {
+    if stamp.record.ok {
+        Ok(StampOk { gen_time_utc: stamp.record.gen_time_utc.clone().unwrap_or_default() })
+    } else {
+        Err(stamp_user_error(stamp.record.error.as_ref()))
+    }
+}
+
+/// File errors while writing the manifest; the card gives no wording for this case.
+fn stamp_file_error(e: anyhow::Error) -> UserError {
+    UserError { message: "处理这批副本时出了问题。点“详细信息”可以查看原因。".into(), detail: format!("{e:#}") }
+}
+
+/// Distribute `job.files` to `job.recipient_ids` through [`distribute::distribute`].
+pub fn run_distribute(
+    job: &DistJob,
+    key: &[u8],
+    registry_dir: &Path,
+    cancel: &AtomicBool,
+    on_event: &mut dyn FnMut(DistEvent),
+) -> Result<DistSummary, UserError> {
+    if job.files.is_empty() {
+        return Err(UserError { message: "请至少添加一张图片。".into(), detail: "no input files".into() });
+    }
+    if job.recipient_ids.is_empty() {
+        return Err(UserError { message: "请至少选择一位接收人。".into(), detail: "no recipients".into() });
+    }
+    let mut reg = open_registry_for_write(registry_dir, key)?;
+    let book = Book::open(registry_dir).map_err(|e| UserError {
+        message: "接收人名单（recipients.json）打不开：文件可能已损坏。".into(),
+        detail: format!("{e:#}"),
+    })?;
+    let mut targets = Vec::with_capacity(job.recipient_ids.len());
+    for id in &job.recipient_ids {
+        let r = book.recipient(id).filter(|r| !r.archived).ok_or_else(|| UserError {
+            message: "有接收人已被修改或归档，请回到上一步重新选择。".into(),
+            detail: format!("recipient {id} not found or archived"),
+        })?;
+        targets.push(Target {
+            id: r.id.clone(),
+            name: r.name.clone(),
+            group_id: r.group_id.clone(),
+            group_name: r.group_id.as_deref().map(|g| book.group_path(g)),
+        });
+    }
+
+    let total = job.files.len() * targets.len();
+    let batch_id = distribute::batch_id_now();
+    let opts = DistOpts {
+        root: job.out_root.clone(),
+        per_recipient_dir: job.per_recipient_dir,
+        suffix: job.suffix.clone(),
+        jpeg_quality: job.jpeg_quality,
+        strength: job.strength,
+        batch_id: batch_id.clone(),
+        tsa: job.tsa.clone(),
+    };
+    let tsa_requested = job.tsa.is_some();
+    let (mut done, mut ok) = (0usize, 0usize);
+    let mut stamping_sent = false;
+    let outcome = distribute::distribute(&job.files, &targets, key, &mut reg, &opts, cancel, &mut |progress| match progress {
+        DistProgress::Start { file_index, target } => on_event(DistEvent::Running {
+            done,
+            total,
+            file: file_name(&job.files[file_index]),
+            recipient: target.name.clone(),
+        }),
+        DistProgress::Done { file_index, target, result } => {
+            done += 1;
+            match result {
+                Ok(copy) => {
+                    ok += 1;
+                    on_event(DistEvent::Item {
+                        file_index,
+                        recipient_id: copy.recipient_id.clone(),
+                        recipient: target.name.clone(),
+                        result: Ok(DistItemOk { id: copy.id, output: copy.path.clone() }),
+                    });
+                }
+                Err(e) => on_event(DistEvent::Item {
+                    file_index,
+                    recipient_id: target.id.clone(),
+                    recipient: target.name.clone(),
+                    result: Err(classify(e, &file_name(&job.files[file_index]), &job.out_root)),
+                }),
+            }
+            if tsa_requested && !stamping_sent && ok > 0 && (done == total || cancel.load(Ordering::SeqCst)) {
+                stamping_sent = true;
+                on_event(DistEvent::Stamping);
+            }
+        }
+    });
+
+    let mut recipients = std::collections::HashSet::new();
+    for copy in &outcome.copies {
+        recipients.insert(copy.recipient_id.as_str());
+    }
+    Ok(DistSummary {
+        batch_id,
+        ok: outcome.copies.len(),
+        failed: outcome.failed.len(),
+        cancelled: outcome.cancelled,
+        recipients: recipients.len(),
+        stamp: outcome.stamp.map(|stamp| stamp.map_err(stamp_file_error).and_then(stamp_ok)),
+    })
+}
+
+/// Ask for the timestamp of an existing batch again.
+pub fn retry_stamp(registry_dir: &Path, batch_id: &str, tsa_url: &str) -> Result<StampOk, UserError> {
+    let stamp = timestamp::retry_batch(registry_dir, batch_id, tsa_url).map_err(stamp_file_error)?;
+    stamp_ok(stamp)
+}
+
 /// Registry and key material prepared for detection.
 pub struct DetectContext {
     registry: Option<Registry>,
@@ -365,9 +545,18 @@ mod tests {
         assert_eq!(summary.ok, 2);
         assert_eq!(summary.failed, 0);
         assert_eq!((running, items), (2, 2));
-        assert_eq!(crate::registry::Registry::open(&regdir).unwrap().entries.len(), 2);
+        let reg = crate::registry::Registry::open(&regdir).unwrap();
+        assert_eq!(reg.entries.len(), 2);
         assert_eq!(outputs.len(), 2);
         assert!(outputs.iter().all(|p| p.exists()));
+        for entry in reg.entries.values() {
+            let bytes = std::fs::read(entry.output.as_ref().unwrap()).unwrap();
+            let sha = {
+                use sha2::Digest as _;
+                hex::encode(sha2::Sha256::digest(&bytes))
+            };
+            assert_eq!(entry.sha256_file.as_deref(), Some(sha.as_str()), "sha256_file must hash the file on disk");
+        }
     }
 
     #[test]
@@ -557,5 +746,88 @@ mod tests {
         assert!(result.report.det.found, "{:?}", result.report.det);
         let entry = result.entry.expect("decoded id should be in the registry");
         assert_eq!(entry.channel.as_deref(), Some(channel));
+    }
+
+    fn book_with(dir: &Path, names: &[&str]) -> Vec<String> {
+        let mut book = Book::open(dir).unwrap();
+        names.iter().map(|n| book.add_recipient(n, None, "").unwrap().id).collect()
+    }
+
+    fn dist_job(files: Vec<PathBuf>, ids: Vec<String>, out: PathBuf) -> DistJob {
+        DistJob {
+            files,
+            recipient_ids: ids,
+            out_root: out,
+            per_recipient_dir: true,
+            suffix: "_wm".into(),
+            strength: crate::wm::DEFAULT_STRENGTH,
+            jpeg_quality: None,
+            tsa: None,
+        }
+    }
+
+    #[test]
+    fn distribute_events_and_summary() {
+        let base = tmp("distribute");
+        let regdir = base.join("registry");
+        let ids = book_with(&regdir, &["张三", "李四"]);
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let a = input.join("a.png");
+        textured_png(&a);
+        let job = dist_job(vec![a], ids, base.join("out"));
+        let cancel = AtomicBool::new(false);
+        let mut running = vec![];
+        let mut items = 0;
+        let mut stamping = 0;
+        let summary = run_distribute(&job, &key(), &regdir, &cancel, &mut |ev| match ev {
+            DistEvent::Running { done, total, .. } => running.push((done, total)),
+            DistEvent::Item { result, .. } => {
+                assert!(result.is_ok());
+                items += 1;
+            }
+            DistEvent::Stamping => stamping += 1,
+        })
+        .unwrap();
+        assert_eq!(running, vec![(0, 2), (1, 2)]);
+        assert_eq!(items, 2);
+        assert_eq!(stamping, 0);
+        assert_eq!((summary.ok, summary.failed, summary.recipients), (2, 0, 2));
+        assert!(summary.batch_id.starts_with("b_"));
+        assert!(summary.stamp.is_none());
+    }
+
+    #[test]
+    fn distribute_rejects_empty_input() {
+        let base = tmp("distribute-empty");
+        let cancel = AtomicBool::new(false);
+        let job = dist_job(vec![], vec!["r_x".into()], base.join("out"));
+        let err = run_distribute(&job, &key(), &base.join("registry"), &cancel, &mut |_| {}).unwrap_err();
+        assert_eq!(err.message, "请至少添加一张图片。");
+        let job = dist_job(vec![base.join("a.png")], vec![], base.join("out"));
+        let err = run_distribute(&job, &key(), &base.join("registry"), &cancel, &mut |_| {}).unwrap_err();
+        assert_eq!(err.message, "请至少选择一位接收人。");
+    }
+
+    #[test]
+    fn distribute_rejects_missing_or_archived_recipient() {
+        let base = tmp("distribute-recipient");
+        let regdir = base.join("registry");
+        let ids = book_with(&regdir, &["张三"]);
+        {
+            let mut book = Book::open(&regdir).unwrap();
+            book.set_archived(&ids[0], true).unwrap();
+        }
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let a = input.join("a.png");
+        textured_png(&a);
+        let cancel = AtomicBool::new(false);
+        let key = key();
+        for id in [ids[0].clone(), "r_00000000".into()] {
+            let job = dist_job(vec![a.clone()], vec![id], base.join("out"));
+            let err = run_distribute(&job, &key, &regdir, &cancel, &mut |_| {}).unwrap_err();
+            assert_eq!(err.message, "有接收人已被修改或归档，请回到上一步重新选择。");
+        }
     }
 }

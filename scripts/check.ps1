@@ -16,7 +16,7 @@ $py = $null
 foreach ($c in 'python3', 'python') {
     if (-not (Get-Command $c -ErrorAction SilentlyContinue)) { continue }
     try {
-        & $c -c 'import cv2, numpy' 2>$null | Out-Null
+        & $c -c 'import cv2, numpy, PIL' 2>$null | Out-Null
         if ($LASTEXITCODE -eq 0) { $py = $c; break }
     } catch { }
 }

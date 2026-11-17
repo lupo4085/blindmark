@@ -37,8 +37,22 @@ pub fn embed_file(
         std::fs::create_dir_all(parent)?;
     }
     save_image(&marked, output, jpeg_quality)?;
+    let sha256_file = {
+        use sha2::Digest as _;
+        hex::encode(sha2::Sha256::digest(std::fs::read(output)?))
+    };
     let src = input.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    reg.register(id, &src, &original, &marked, channel, strength, Some(output.display().to_string()))?;
+    let meta = registry::CopyMeta { sha256_file: Some(sha256_file), ..Default::default() };
+    reg.register_full(
+        id,
+        &src,
+        &original,
+        &marked,
+        channel,
+        strength,
+        Some(output.display().to_string()),
+        Some(&meta),
+    )?;
     Ok(EmbedResult { id, psnr })
 }
 
