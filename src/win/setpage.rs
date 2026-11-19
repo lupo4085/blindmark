@@ -35,6 +35,8 @@ const DEFAULTS: u16 = 1424;
 const APPLY: u16 = 1425;
 const UNLOAD_KEY: u16 = 1426;
 const UNLOAD_REG: u16 = 1427;
+const TSA: u16 = 1428;
+const TSA_DEFAULT: u16 = 1429;
 
 const THREAD_CHOICES: [usize; 7] = [0, 1, 2, 4, 8, 12, 16];
 
@@ -80,6 +82,10 @@ pub struct SetPage {
     start_tab: HWND,
     remember: HWND,
     autoclip: HWND,
+    l_tsa: HWND,
+    tsa: HWND,
+    tsa_default: HWND,
+    tsa_note: HWND,
     // bottom
     defaults: HWND,
     apply: HWND,
@@ -139,6 +145,10 @@ impl SetPage {
         }
         let remember = checkbox(p, REMEMBER, "记住窗口大小和位置");
         let autoclip = checkbox(p, AUTOCLIP, "切换到“检测”时自动读取剪贴板里的图片");
+        let l_tsa = label(p, "可信时间戳服务");
+        let tsa = edit(p, TSA, "");
+        let tsa_default = button(p, TSA_DEFAULT, "恢复默认");
+        let tsa_note = label(p, "只有在加水印或分发时勾选“申请可信时间戳”才会联网，并且只发送这批文件的摘要。");
         let defaults = button(p, DEFAULTS, "恢复默认值");
         let apply = default_button(p, APPLY, "应用");
         SetPage {
@@ -178,6 +188,10 @@ impl SetPage {
             start_tab,
             remember,
             autoclip,
+            l_tsa,
+            tsa,
+            tsa_default,
+            tsa_note,
             defaults,
             apply,
         }
@@ -190,7 +204,7 @@ impl SetPage {
 
 pub fn is_hint(a: &App, h: HWND) -> bool {
     let s = &a.sett;
-    h == s.key_fp || h == s.reg_info || h == s.meta_note || h == s.threads_note
+    h == s.key_fp || h == s.reg_info || h == s.meta_note || h == s.threads_note || h == s.tsa_note
 }
 
 pub fn layout(a: &App, w: i32, _h: i32) {
@@ -272,7 +286,7 @@ pub fn layout(a: &App, w: i32, _h: i32) {
     mv(s.threads_note, rx + pad + sc(230), r + sc(4), sc(100), sc(20));
     y += dgh + gap;
     // --- general (right)
-    let ggh = sc(120);
+    let ggh = sc(186);
     mv(s.groups[4], rx, y, col_w, ggh);
     let mut r = y + sc(24);
     mv(s.l_start, rx + pad, r + sc(4), sc(78), sc(20));
@@ -281,6 +295,12 @@ pub fn layout(a: &App, w: i32, _h: i32) {
     mv(s.remember, rx + pad, r, col_w - 2 * pad, sc(22));
     r += sc(26);
     mv(s.autoclip, rx + pad, r, col_w - 2 * pad, sc(22));
+    r += sc(26);
+    mv(s.l_tsa, rx + pad, r + sc(4), sc(88), sc(20));
+    mv(s.tsa, rx + pad + sc(90), r, col_w - 2 * pad - sc(90) - sc(96), sc(24));
+    mv(s.tsa_default, rx + col_w - pad - sc(92), r - sc(2), sc(92), bh);
+    r += sc(30);
+    mv(s.tsa_note, rx + pad, r + sc(2), col_w - 2 * pad, sc(34));
     y += ggh + gap;
     // --- buttons (right, under general)
     mv(s.apply, rx + col_w - sc(90), y, sc(90), bh);
@@ -305,6 +325,7 @@ fn controls_from(a: &App, c: &Settings) {
     cb_set_sel(s.start_tab, if c.start_tab < 0 { 4 } else { c.start_tab.min(3) });
     set_check(s.remember, c.remember_window);
     set_check(s.autoclip, c.auto_clipboard);
+    set_text(s.tsa, &c.tsa_url);
 }
 
 /// Refresh every control from the saved settings and the loaded key / registry.
@@ -360,6 +381,12 @@ fn read_controls(a: &App) -> Result<Settings, String> {
     };
     c.remember_window = checked(s.remember);
     c.auto_clipboard = checked(s.autoclip);
+    let tsa = get_text(s.tsa).trim().to_string();
+    let rest = tsa.strip_prefix("https://").or_else(|| tsa.strip_prefix("http://"));
+    if rest.map_or(true, str::is_empty) {
+        return Err("时间戳服务地址请填写以 https:// 开头的网址。".into());
+    }
+    c.tsa_url = tsa;
     Ok(c)
 }
 
@@ -368,10 +395,13 @@ fn apply(a: &mut App) {
         Ok(c) => {
             let threads_changed = c.threads != a.cfg.threads;
             a.cfg = c;
-            a.cfg.save();
+            let saved = a.cfg.save();
             // New defaults also become the current choices on the Embed page.
             super::embed::apply_defaults(a);
-            a.set_status(if threads_changed { "设置已保存（线程数重启后生效）" } else { "设置已保存" });
+            match saved {
+                Ok(()) => a.set_status(if threads_changed { "设置已保存（线程数重启后生效）" } else { "设置已保存" }),
+                Err(e) => a.set_status(&format!("设置没能保存：{e}")),
+            }
         }
         Err(e) => warn(a.hwnd, &e),
     }
@@ -396,12 +426,15 @@ pub fn command(a: &mut App, id: u16, code: u32, _ctl: HWND) {
         REG_DIR => {
             if let Some(d) = pick_folder(a.hwnd, "选择登记表文件夹（新文件夹会自动创建登记表）") {
                 a.cfg.registry_dir = d;
-                a.cfg.save();
+                let saved = a.cfg.save();
                 a.reload_registry();
                 if let Some(e) = a.reg_error.clone() {
                     warn(a.hwnd, &format!("这个文件夹里的登记表不能和当前密钥一起使用：\n{e}"));
                 }
                 load(a);
+                if let Err(e) = saved {
+                    a.set_status(&format!("设置没能保存：{e}"));
+                }
             }
         }
         REG_OPEN => {
@@ -428,6 +461,7 @@ pub fn command(a: &mut App, id: u16, code: u32, _ctl: HWND) {
         }
         UNLOAD_KEY => a.unload_key(),
         UNLOAD_REG => a.unload_registry(),
+        TSA_DEFAULT => set_text(a.sett.tsa, blindmark::timestamp::DEFAULT_TSA),
         APPLY => apply(a),
         _ => {}
     }
