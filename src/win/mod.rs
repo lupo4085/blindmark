@@ -30,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::*;
 use blindmark::jobs::{EmbedOk, UserError};
 use blindmark::registry::{Registry, ThumbIndex};
 use blindmark::{keys, Report};
-use config::Settings;
+use config::{LoadProblem, Settings};
 use util::*;
 
 pub const WM_WORKER: u32 = WM_APP + 1;
@@ -142,18 +142,22 @@ pub fn run() {
         };
         InitCommonControlsEx(&icc);
     }
-    let cfg = Settings::load();
+    let (cfg, load_problem) = Settings::load();
     if cfg.threads > 0 {
         let _ = rayon::ThreadPoolBuilder::new().num_threads(cfg.threads).build_global();
     }
     register_classes();
     controls::register_classes();
 
+    let title = match config::test_data_dir() {
+        Some(d) => format!("blindmark 盲水印（测试数据：{}）", d.display()),
+        None => "blindmark 盲水印".to_string(),
+    };
     let hwnd = unsafe {
         CreateWindowExW(
             WS_EX_ACCEPTFILES | WS_EX_CONTROLPARENT,
             MAIN_CLASS,
-            w("blindmark 盲水印").as_ptr(),
+            w(&title).as_ptr(),
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             CW_USEDEFAULT,
             CW_USEDEFAULT,
@@ -248,6 +252,30 @@ pub fn run() {
     a.select_tab(start.clamp(0, 3) as usize);
     a.layout();
     unsafe { UpdateWindow(hwnd) };
+
+    // Shown once, after the main window is visible; later saves write a fresh settings.json.
+    if let Some(LoadProblem::Unreadable { backup, .. }) = load_problem {
+        match backup {
+            Some(p) => warn(
+                hwnd,
+                &format!(
+                    "设置文件（settings.json）读不出来，已改用默认设置。\n\n原文件另存为：{}\n里面记录的密钥和登记表位置，可以在“设置”选项卡里照着改回来。",
+                    p.display()
+                ),
+            ),
+            None => {
+                // Never overwrite the only copy that is left.
+                config::block_saving();
+                warn(
+                    hwnd,
+                    &format!(
+                        "设置文件（settings.json）读不出来，已改用默认设置。原文件没能另存，也没有改动：{}",
+                        Settings::path().display()
+                    ),
+                );
+            }
+        }
+    }
 
     if a.cfg.show_start_wizard {
         a.open_start();
@@ -520,11 +548,14 @@ impl App {
         match res {
             Ok(fp) => {
                 self.cfg.key_path = path.to_path_buf();
-                self.cfg.save();
+                let saved = self.cfg.save();
                 info(
                     self.hwnd,
                     &format!("已新建密钥（指纹 {fp}）：\n{}\n\n请立刻把这个文件备份到安全的地方。丢失密钥后将无法再读出水印。", path.display()),
                 );
+                if let Err(e) = saved {
+                    self.set_status(&format!("设置没能保存：{e}"));
+                }
                 true
             }
             Err(e) => {
@@ -560,9 +591,12 @@ impl App {
             match ok {
                 Ok(_) => {
                     self.cfg.key_path = p;
-                    self.cfg.save();
+                    let saved = self.cfg.save();
                     self.load_key_and_registry(false);
                     setpage::load(self);
+                    if let Err(e) = saved {
+                        self.set_status(&format!("设置没能保存：{e}"));
+                    }
                 }
                 Err(e) => error(self.hwnd, &format!("这不是有效的密钥文件：{e}")),
             }
@@ -583,10 +617,13 @@ impl App {
         }
         self.key = None;
         self.cfg.key_path = PathBuf::new();
-        self.cfg.save();
+        let saved = self.cfg.save();
         self.reload_registry();
         self.set_status("密钥已卸载（文件保留在原处）");
         setpage::load(self);
+        if let Err(e) = saved {
+            self.set_status(&format!("设置没能保存：{e}"));
+        }
     }
 
     /// Detach the registry folder from the app. Nothing on disk is removed.
@@ -603,10 +640,13 @@ impl App {
         }
         self.reg = None;
         self.cfg.registry_dir = PathBuf::new();
-        self.cfg.save();
+        let saved = self.cfg.save();
         self.reload_registry();
         self.set_status("登记表已卸载（文件夹保留在原处）");
         setpage::load(self);
+        if let Err(e) = saved {
+            self.set_status(&format!("设置没能保存：{e}"));
+        }
     }
 
     pub fn backup_registry(&mut self) {
@@ -633,9 +673,10 @@ impl App {
             embed_files: embed::files(self),
         };
         let result = start::run(self.hwnd, ctx);
+        let mut save_error: Option<String> = None;
         if result.show_on_start != self.cfg.show_start_wizard {
             self.cfg.show_start_wizard = result.show_on_start;
-            self.cfg.save();
+            save_error = self.cfg.save().err();
         }
         let mut show_registry: Option<Vec<u32>> = None;
         let mut settings_changed = false;
@@ -644,7 +685,7 @@ impl App {
             start::WizardOutcome::SettingsChanged { key_path, registry_dir } => {
                 self.cfg.key_path = key_path;
                 self.cfg.registry_dir = registry_dir;
-                self.cfg.save();
+                save_error = self.cfg.save().err();
                 settings_changed = true;
             }
             start::WizardOutcome::ShowTab(i) => self.select_tab(i),
@@ -665,6 +706,9 @@ impl App {
             if ids.len() > 1 {
                 self.set_status(&format!("本次共 {} 条，已选中第一条", ids.len()));
             }
+        }
+        if let Some(e) = save_error {
+            self.set_status(&format!("设置没能保存：{e}"));
         }
     }
 
@@ -803,7 +847,9 @@ impl App {
                 self.cfg.window = Some([r.left, r.top, r.right, r.bottom, (wp.showCmd == SW_SHOWMAXIMIZED as u32) as i32]);
             }
         }
-        self.cfg.save();
+        if let Err(e) = self.cfg.save() {
+            self.set_status(&format!("设置没能保存：{e}"));
+        }
     }
 }
 
