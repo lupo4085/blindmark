@@ -35,10 +35,8 @@ pub struct WatermarkNotReadable {
 
 impl std::fmt::Display for WatermarkNotReadable {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(
-            f,
-            "{}: the picture is too flat (large pure black or white areas) to hold a watermark; it could not be read back, so nothing was saved.",
-            self.file
+        f.write_str(
+            "the picture is too flat (large pure black or white areas) to hold a watermark; it could not be read back, so nothing was saved.",
         )
     }
 }

@@ -249,12 +249,16 @@ fn run(cli: Cli) -> Result<()> {
                 let cancel = std::sync::atomic::AtomicBool::new(false);
                 let mut rows = Vec::new();
                 let mut weak = 0usize;
+                let files = job.files.clone();
                 let summary = run_distribute(&job, &k, &registry, &cancel, &mut |ev| match ev {
                     DistEvent::Running { .. } | DistEvent::Stamping => {}
                     DistEvent::Item { recipient_id, recipient, result: Ok(ok), .. } => {
                         rows.push((ok, recipient_id, recipient))
                     }
-                    DistEvent::Item { result: Err(e), .. } => eprintln!("{}", e.message),
+                    DistEvent::Item { file_index, recipient, result: Err(e), .. } => {
+                        let input = files.get(file_index).cloned().unwrap_or_default();
+                        eprintln!("error: {} -> {recipient}: {}", input.display(), e.detail);
+                    }
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 

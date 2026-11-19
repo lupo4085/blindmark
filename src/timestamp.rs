@@ -25,8 +25,8 @@ pub const DEFAULT_TSA: &str = "https://freetsa.org/tsr";
 /// Written once into `timestamps/README.txt`. The OpenSSL command is meant to be copied
 /// verbatim; the two certificate files are the user's business.
 const README: &str = "\
-每个子文件夹是一批分发的副本。
-manifest.json   这批副本的清单（编号、接收人、文件的 SHA-256）
+每个子文件夹是一批加水印或分发的副本。
+manifest.json   这批副本的清单（编号、接收人（分发时才有）、文件的 SHA-256）
 response.tsr    时间戳服务签名的回执，证明清单在 tsa.json 里的 gen_time_utc 之前就已存在
 
 独立核验（需要 OpenSSL，以及时间戳服务的 CA 证书和 TSA 证书）：
