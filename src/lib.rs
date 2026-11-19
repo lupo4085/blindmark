@@ -25,10 +25,32 @@ pub enum EmbedCheck {
     Unreadable,
 }
 
+/// The watermark could not be read back from the saved file: the picture is too flat
+/// (large pure black / white areas). The output was deleted and nothing was registered.
+#[derive(Debug)]
+pub struct WatermarkNotReadable {
+    /// The input file name.
+    pub file: String,
+}
+
+impl std::fmt::Display for WatermarkNotReadable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "{}: the picture is too flat (large pure black or white areas) to hold a watermark; it could not be read back, so nothing was saved.",
+            self.file
+        )
+    }
+}
+
+impl std::error::Error for WatermarkNotReadable {}
+
+#[derive(Debug)]
 pub struct EmbedResult {
     pub id: u32,
     pub psnr: f64,
     pub check: EmbedCheck,
+    pub sha256_file: String,
 }
 
 /// Re-detect a freshly saved watermarked file. `id` is the ID just embedded.
@@ -50,7 +72,7 @@ pub fn check_embedded(saved: &Path, key: &[u8], id: u32) -> Result<EmbedCheck> {
     }
 }
 
-/// Load -> embed -> save -> register. Used by both the GUI and the CLI.
+/// Load -> embed -> save -> read back -> register. Used by both the GUI and the CLI.
 pub fn embed_file(
     input: &Path,
     output: &Path,
@@ -60,7 +82,23 @@ pub fn embed_file(
     channel: Option<String>,
     jpeg_quality: Option<u8>,
 ) -> Result<EmbedResult> {
+    embed_file_with(input, output, key, reg, strength, channel, jpeg_quality, None)
+}
+
+/// Same as [`embed_file`], with `batch_id` written into the registry entry when it is set.
+#[allow(clippy::too_many_arguments)]
+pub fn embed_file_with(
+    input: &Path,
+    output: &Path,
+    key: &[u8],
+    reg: &mut Registry,
+    strength: f32,
+    channel: Option<String>,
+    jpeg_quality: Option<u8>,
+    batch_id: Option<&str>,
+) -> Result<EmbedResult> {
     let original = load_image(input)?;
+    let file = input.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
     let id = reg.new_id()?;
     let mut marked = original.clone();
     let psnr = wm::embed_rgb(&mut marked.data, marked.w, marked.h, key, id, strength);
@@ -72,12 +110,25 @@ pub fn embed_file(
         use sha2::Digest as _;
         hex::encode(sha2::Sha256::digest(std::fs::read(output)?))
     };
-    let check = check_embedded(output, key, id).unwrap_or(EmbedCheck::Unreadable);
-    let src = input.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-    let meta = registry::CopyMeta { sha256_file: Some(sha256_file), ..Default::default() };
+    let check = match check_embedded(output, key, id) {
+        Ok(check) => check,
+        Err(e) => {
+            let _ = std::fs::remove_file(output);
+            return Err(e.context("could not read back the saved file"));
+        }
+    };
+    if check == EmbedCheck::Unreadable {
+        let _ = std::fs::remove_file(output);
+        return Err(anyhow::Error::new(WatermarkNotReadable { file }));
+    }
+    let meta = registry::CopyMeta {
+        sha256_file: Some(sha256_file.clone()),
+        batch_id: batch_id.map(str::to_string),
+        ..Default::default()
+    };
     reg.register_full(
         id,
-        &src,
+        &file,
         &original,
         &marked,
         channel,
@@ -85,7 +136,7 @@ pub fn embed_file(
         Some(output.display().to_string()),
         Some(&meta),
     )?;
-    Ok(EmbedResult { id, psnr, check })
+    Ok(EmbedResult { id, psnr, check, sha256_file })
 }
 
 /// `dir/stem{suffix}.{ext}`, adding 2, 3, ... until the name is free.
@@ -253,15 +304,17 @@ mod tests {
     }
 
     #[test]
-    fn flat_screenshot_is_unreadable() {
+    fn flat_screenshot_is_not_saved() {
         let base = tmp("flat");
         let input = base.join("black.png");
         black_screenshot(&input);
         let mut reg = Registry::open(&base.join("registry")).unwrap();
         let out = base.join("black_wm.png");
         let k = key();
-        let r = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, None).unwrap();
-        assert_eq!(r.check, EmbedCheck::Unreadable);
+        let err = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, None).unwrap_err();
+        assert!(err.downcast_ref::<WatermarkNotReadable>().is_some(), "{err:#}");
+        assert!(!out.exists(), "a copy that cannot be read back must not stay on disk");
+        assert_eq!(reg.entries.len(), 0, "nothing may be registered for an unreadable copy");
         let _ = std::fs::remove_dir_all(&base);
     }
 
@@ -275,6 +328,12 @@ mod tests {
         let k = key();
         let r = embed_file(&input, &out, &k, &mut reg, wm::DEFAULT_STRENGTH, None, None).unwrap();
         assert_eq!(r.check, EmbedCheck::Ok);
+        let bytes = std::fs::read(&out).unwrap();
+        let sha = {
+            use sha2::Digest as _;
+            hex::encode(sha2::Sha256::digest(&bytes))
+        };
+        assert_eq!(r.sha256_file, sha, "sha256_file must hash the file on disk");
         let _ = std::fs::remove_dir_all(&base);
     }
 

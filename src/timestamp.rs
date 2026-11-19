@@ -1,4 +1,4 @@
-//! Trusted timestamps (RFC 3161) for a distribution batch.
+//! Trusted timestamps (RFC 3161) for a batch of copies, watermarking or distribution.
 //!
 //! A batch manifest is written next to the registry, hashed, and that hash (with a random
 //! nonce) is sent to a Time-Stamp Authority. The signed reply proves that the manifest — and
@@ -56,6 +56,20 @@ pub struct Manifest {
     pub created_utc: String,
     pub key_fingerprint: String,
     pub copies: Vec<ManifestCopy>,
+}
+
+impl Manifest {
+    /// The manifest of one batch. Every batch-producing job builds it here, so watermarking
+    /// and distribution write the same fields.
+    pub fn new(batch_id: &str, key: &[u8], copies: Vec<ManifestCopy>) -> Manifest {
+        Manifest {
+            format: MANIFEST_FORMAT.to_string(),
+            batch_id: batch_id.to_string(),
+            created_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            key_fingerprint: crate::keys::fingerprint(key),
+            copies,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]

@@ -198,6 +198,8 @@ pub struct EmbedJob {
     /// `None` means PNG output.
     pub jpeg_quality: Option<u8>,
     pub channel: Option<String>,
+    /// When set, the batch manifest is sent to this TSA for a trusted timestamp.
+    pub tsa: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -206,12 +208,15 @@ pub struct EmbedOk {
     pub psnr: f64,
     pub output: PathBuf,
     pub check: crate::EmbedCheck,
+    pub sha256_file: String,
 }
 
 #[derive(Clone, Debug)]
 pub enum EmbedEvent {
     Running { index: usize },
     Item { index: usize, result: Result<EmbedOk, UserError> },
+    /// Sent once, right before the trusted-timestamp request starts.
+    Stamping,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -219,12 +224,22 @@ pub struct EmbedSummary {
     pub ok: usize,
     pub failed: usize,
     pub cancelled: bool,
+    pub batch_id: String,
+    pub stamp: Option<Result<StampOk, UserError>>,
 }
 
 /// Classify a single-image failure into the copy from `ui-copy.md` section 2.
 fn classify(e: &anyhow::Error, name: &str, out_dir: &Path) -> UserError {
     let detail = format!("{e:#}");
     for cause in e.chain() {
+        if cause.downcast_ref::<crate::WatermarkNotReadable>().is_some() {
+            return UserError {
+                message: format!(
+                    "{name} 大面积是纯色，装不下水印：加完以后读不回来，所以没有保存，也没有登记。换一张内容更丰富的图，或者裁掉纯色区域再试。"
+                ),
+                detail,
+            };
+        }
         if cause.downcast_ref::<distribute::UnreadableImage>().is_some() {
             return UserError {
                 message: format!("无法打开 {name}：文件可能已损坏，或者不是支持的图片格式。"),
@@ -272,7 +287,9 @@ pub fn run_embed(
     on_event: &mut dyn FnMut(EmbedEvent),
 ) -> Result<EmbedSummary, UserError> {
     let mut reg = open_registry_for_write(registry_dir, key)?;
-    let mut summary = EmbedSummary::default();
+    let batch_id = distribute::batch_id_now();
+    let mut summary = EmbedSummary { batch_id: batch_id.clone(), ..Default::default() };
+    let mut manifest_copies: Vec<timestamp::ManifestCopy> = Vec::new();
     for (index, path) in job.files.iter().enumerate() {
         if cancel.load(Ordering::SeqCst) {
             summary.cancelled = true;
@@ -283,20 +300,48 @@ pub fn run_embed(
         let out_dir = job.out_dir.clone().unwrap_or_else(|| path.parent().map(Path::to_path_buf).unwrap_or_default());
         let output = crate::unique_output_path(&out_dir, path, &job.suffix, job.jpeg_quality.is_some());
         let result = match std::fs::File::open(path) {
-            Ok(_) => crate::embed_file(path, &output, key, &mut reg, job.strength, job.channel.clone(), job.jpeg_quality)
-                .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone(), check: r.check })
-                .map_err(|e| classify(&e, &name, &out_dir)),
+            Ok(_) => crate::embed_file_with(
+                path,
+                &output,
+                key,
+                &mut reg,
+                job.strength,
+                job.channel.clone(),
+                job.jpeg_quality,
+                Some(&batch_id),
+            )
+            .map(|r| EmbedOk { id: r.id, psnr: r.psnr, output: output.clone(), check: r.check, sha256_file: r.sha256_file })
+            .map_err(|e| classify(&e, &name, &out_dir)),
             Err(e) => Err(UserError {
                 message: format!("无法打开 {name}：文件可能已损坏，或者不是支持的图片格式。"),
                 detail: format!("{e:#}"),
             }),
         };
-        if result.is_ok() {
+        if let Ok(ok) = &result {
             summary.ok += 1;
+            manifest_copies.push(timestamp::ManifestCopy {
+                id: format!("0x{:08x}", ok.id),
+                recipient_id: None,
+                recipient_name: None,
+                source: name.clone(),
+                sha256_file: ok.sha256_file.clone(),
+                check: Some(ok.check),
+            });
         } else {
             summary.failed += 1;
         }
         on_event(EmbedEvent::Item { index, result });
+    }
+    if let Some(url) = &job.tsa {
+        if !manifest_copies.is_empty() {
+            on_event(EmbedEvent::Stamping);
+            let manifest = timestamp::Manifest::new(&batch_id, key, manifest_copies);
+            summary.stamp = Some(
+                timestamp::stamp_batch(&reg.dir, &manifest, url)
+                    .map_err(stamp_file_error)
+                    .and_then(stamp_ok),
+            );
+        }
     }
     Ok(summary)
 }
@@ -556,6 +601,25 @@ mod tests {
         crate::keys::generate_key().unwrap()
     }
 
+    /// 720×1600, almost all black. The bottom 60 rows carry noise so `too_flat` does not
+    /// reject the picture before the watermark is considered.
+    fn black_screenshot(path: &Path) {
+        let (w, h) = (720usize, 1600usize);
+        let mut data = vec![0u8; w * h * 3];
+        let mut s: u32 = 0x9e37_79b9;
+        for y in (h - 60)..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (s >> 24) as u8;
+                let i = (y * w + x) * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        image::save_buffer(path, &data, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
+    }
+
     fn job(files: Vec<PathBuf>, out_dir: Option<PathBuf>, channel: Option<&str>) -> EmbedJob {
         EmbedJob {
             files,
@@ -564,6 +628,7 @@ mod tests {
             strength: crate::wm::DEFAULT_STRENGTH,
             jpeg_quality: None,
             channel: channel.map(str::to_string),
+            tsa: None,
         }
     }
 
@@ -591,6 +656,7 @@ mod tests {
                     outputs.push(ok.output);
                 }
             }
+            EmbedEvent::Stamping => {}
         })
         .unwrap();
         assert_eq!(summary.ok, 2);
@@ -608,6 +674,160 @@ mod tests {
             };
             assert_eq!(entry.sha256_file.as_deref(), Some(sha.as_str()), "sha256_file must hash the file on disk");
         }
+    }
+
+    #[test]
+    fn embed_without_tsa_makes_a_batch() {
+        let base = tmp("embed-batch");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let a = input.join("a.png");
+        textured_png(&a);
+        let key = key();
+        let regdir = base.join("registry");
+        let job = job(vec![a], Some(base.join("out")), None);
+        let cancel = AtomicBool::new(false);
+        let mut stamping = 0;
+        let summary = run_embed(&job, &key, &regdir, &cancel, &mut |ev| {
+            if let EmbedEvent::Stamping = ev {
+                stamping += 1;
+            }
+        })
+        .unwrap();
+        assert_eq!(summary.ok, 1);
+        assert!(summary.batch_id.starts_with("b_"));
+        assert!(summary.stamp.is_none());
+        assert_eq!(stamping, 0, "no timestamp request means no Stamping event");
+        let reg = crate::registry::Registry::open(&regdir).unwrap();
+        assert_eq!(reg.entries.len(), 1);
+        let entry = reg.entries.values().next().unwrap();
+        assert_eq!(entry.batch_id.as_deref(), Some(summary.batch_id.as_str()));
+        assert!(!regdir.join("timestamps").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Port 9 on this host: nothing listens there, so the request fails at once and never
+    /// leaves the machine.
+    const REFUSED_TSA: &str = "http://127.0.0.1:9/tsr";
+
+    #[test]
+    fn embed_timestamp_failure_keeps_the_pictures() {
+        let base = tmp("embed-stamp-fail");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let a = input.join("a.png");
+        textured_png(&a);
+        let key = key();
+        let regdir = base.join("registry");
+        let mut job = job(vec![a], Some(base.join("out")), None);
+        job.tsa = Some(REFUSED_TSA.into());
+        let cancel = AtomicBool::new(false);
+        let mut stamping = 0;
+        let mut outputs = vec![];
+        let summary = run_embed(&job, &key, &regdir, &cancel, &mut |ev| match ev {
+            EmbedEvent::Stamping => stamping += 1,
+            EmbedEvent::Item { result: Ok(ok), .. } => outputs.push(ok.output),
+            EmbedEvent::Item { result: Err(_), .. } | EmbedEvent::Running { .. } => {}
+        })
+        .unwrap();
+        assert_eq!(stamping, 1);
+        assert_eq!(summary.ok, 1);
+        let stamp = summary.stamp.as_ref().expect("a timestamp attempt must be recorded");
+        match stamp {
+            Err(e) => assert!(
+                e.message.starts_with("暂时没能获取时间戳（无法连接 127.0.0.1:9）。"),
+                "{}",
+                e.message
+            ),
+            Ok(_) => panic!("nothing listens on port 9"),
+        }
+        assert_eq!(outputs.len(), 1);
+        assert!(outputs[0].exists(), "a timestamp failure must not delete the picture");
+        let reg = crate::registry::Registry::open(&regdir).unwrap();
+        assert_eq!(reg.entries.len(), 1);
+        assert!(regdir.join("timestamps").join(&summary.batch_id).join("manifest.json").exists());
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn embed_all_flat_sends_no_stamping() {
+        let base = tmp("embed-flat-stamp");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let black = input.join("black.png");
+        black_screenshot(&black);
+        let key = key();
+        let regdir = base.join("registry");
+        let mut job = job(vec![black], Some(base.join("out")), None);
+        job.tsa = Some(REFUSED_TSA.into());
+        let cancel = AtomicBool::new(false);
+        let mut stamping = 0;
+        let mut messages = vec![];
+        let summary = run_embed(&job, &key, &regdir, &cancel, &mut |ev| match ev {
+            EmbedEvent::Stamping => stamping += 1,
+            EmbedEvent::Item { result: Err(e), .. } => messages.push(e.message),
+            _ => {}
+        })
+        .unwrap();
+        assert_eq!((summary.ok, summary.failed), (0, 1));
+        assert!(summary.stamp.is_none());
+        assert_eq!(stamping, 0, "no successful picture means no timestamp request");
+        assert_eq!(messages.len(), 1);
+        assert!(
+            messages[0].starts_with("black.png 大面积是纯色，装不下水印：加完以后读不回来，所以没有保存，也没有登记。"),
+            "{}",
+            messages[0]
+        );
+        let reg = crate::registry::Registry::open(&regdir).unwrap();
+        assert_eq!(reg.entries.len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// Watermarking and distribution must write the same manifest fields; both are built by
+    /// `timestamp::Manifest::new`.
+    #[test]
+    fn embed_and_distribute_write_the_same_manifest_fields() {
+        let base = tmp("manifest-fields");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let a = input.join("a.png");
+        textured_png(&a);
+        let key = key();
+        let regdir = base.join("registry");
+        let cancel = AtomicBool::new(false);
+
+        let mut embed = job(vec![a.clone()], Some(base.join("out-embed")), None);
+        embed.tsa = Some(REFUSED_TSA.into());
+        let embed_summary = run_embed(&embed, &key, &regdir, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(embed_summary.ok, 1);
+
+        let ids = book_with(&regdir, &["张三"]);
+        let dist = DistJob {
+            files: vec![a],
+            recipient_ids: ids,
+            out_root: base.join("out-dist"),
+            per_recipient_dir: true,
+            suffix: "_wm".into(),
+            strength: crate::wm::DEFAULT_STRENGTH,
+            jpeg_quality: None,
+            tsa: Some(REFUSED_TSA.into()),
+        };
+        let dist_summary = run_distribute(&dist, &key, &regdir, &cancel, &mut |_| {}).unwrap();
+        assert_eq!(dist_summary.ok, 1);
+
+        let read = |batch: &str| -> crate::timestamp::Manifest {
+            let p = regdir.join("timestamps").join(batch).join("manifest.json");
+            serde_json::from_slice(&std::fs::read(&p).unwrap()).unwrap()
+        };
+        let m_embed = read(&embed_summary.batch_id);
+        let m_dist = read(&dist_summary.batch_id);
+        assert_eq!(m_embed.format, m_dist.format);
+        assert_eq!(m_embed.key_fingerprint, m_dist.key_fingerprint);
+        assert_eq!(m_embed.format, crate::timestamp::MANIFEST_FORMAT);
+        assert_eq!(m_embed.key_fingerprint, crate::keys::fingerprint(&key));
+        assert!(m_embed.copies[0].recipient_id.is_none());
+        assert!(m_dist.copies[0].recipient_id.is_some());
+        let _ = std::fs::remove_dir_all(&base);
     }
 
     #[test]

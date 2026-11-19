@@ -2055,6 +2055,7 @@ fn start_embed(h: HWND) {
         strength: s.strength,
         jpeg_quality: s.jpeg.then_some(s.ctx.cfg.jpeg_quality),
         channel: if s.note.trim().is_empty() { None } else { Some(s.note.trim().to_string()) },
+        tsa: None,
     };
     let regdir = s.registry_dir.clone();
     let total = job.files.len();
@@ -2198,6 +2199,7 @@ unsafe fn page_e3_impl(h: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> isize {
                         finished = true;
                         finish_embed(h, res);
                     }
+                    EmbedMsg::Event(EmbedEvent::Stamping) => {}
                 }
             }
             if finished {

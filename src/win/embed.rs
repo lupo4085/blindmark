@@ -432,6 +432,7 @@ fn start(a: &mut App) {
             strength,
             jpeg_quality: jpeg.then_some(quality),
             channel: chan,
+            tsa: None,
         };
         let cancelled = match run_embed(&job, &key, &regdir, cancel.as_ref(), &mut |ev| match ev {
             EmbedEvent::Running { index } => {
@@ -444,6 +445,7 @@ fn start(a: &mut App) {
                     post(&tx, hw, WorkerMsg::EmbedItem { row, res: result });
                 }
             }
+            EmbedEvent::Stamping => {}
         }) {
             Ok(summary) => summary.cancelled,
             Err(e) => {
