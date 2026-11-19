@@ -63,13 +63,20 @@ fn default_tsa_url() -> String {
     blindmark::timestamp::DEFAULT_TSA.to_string()
 }
 
-/// Pure function, so it can be tested: a non-blank value wins, otherwise
+/// The folder named by `BLINDMARK_DATA_DIR`, ignoring a blank value and surrounding blanks.
+fn custom_data_dir(env: Option<OsString>) -> Option<PathBuf> {
+    let v = env?;
+    let s = v.to_string_lossy().trim().to_string();
+    if s.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(s))
+}
+
+/// Pure function, so it can be tested: a non-blank value wins (trimmed), otherwise
 /// `dirs::config_dir()/blindmark`.
 fn app_dir_from(env: Option<OsString>) -> PathBuf {
-    match env {
-        Some(v) if !v.to_string_lossy().trim().is_empty() => PathBuf::from(v),
-        _ => dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("blindmark"),
-    }
+    custom_data_dir(env).unwrap_or_else(|| dirs::config_dir().unwrap_or_else(|| PathBuf::from(".")).join("blindmark"))
 }
 
 pub fn app_dir() -> PathBuf {
@@ -78,11 +85,7 @@ pub fn app_dir() -> PathBuf {
 
 /// The folder in use when `BLINDMARK_DATA_DIR` is set, otherwise `None`.
 pub fn test_data_dir() -> Option<PathBuf> {
-    let v = std::env::var_os("BLINDMARK_DATA_DIR")?;
-    if v.to_string_lossy().trim().is_empty() {
-        return None;
-    }
-    Some(PathBuf::from(v))
+    custom_data_dir(std::env::var_os("BLINDMARK_DATA_DIR"))
 }
 
 /// What went wrong while reading `settings.json`.
@@ -211,6 +214,7 @@ mod tests {
         let default = app_dir_from(None);
         assert_eq!(default.file_name().unwrap(), "blindmark");
         assert_eq!(app_dir_from(Some(OsString::from("D:\\x"))), PathBuf::from("D:\\x"));
+        assert_eq!(app_dir_from(Some(OsString::from("  D:\\x  "))), PathBuf::from("D:\\x"));
         assert_eq!(app_dir_from(Some(OsString::from("  "))), default);
     }
 

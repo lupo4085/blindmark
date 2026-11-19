@@ -398,7 +398,7 @@ fn start(a: &mut App) {
     let suffix = a.cfg.suffix.clone();
     a.cfg.last_channel = channel.clone();
     a.cfg.open_folder_after = checked(a.embed.open_after);
-    a.cfg.save();
+    let saved = a.cfg.save();
 
     for (row, _) in &jobs {
         a.embed.items[*row].state = State::Pending;
@@ -414,6 +414,9 @@ fn start(a: &mut App) {
     pb_set(a.embed.progress, 0, jobs.len());
     set_busy(a, true);
     a.set_status(&format!("正在加水印 0 / {}", jobs.len()));
+    if let Err(e) = saved {
+        a.set_status(&format!("设置没能保存：{e}"));
+    }
 
     let tx = a.tx.clone();
     let hw = a.hwnd as isize;
