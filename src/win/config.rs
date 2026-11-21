@@ -47,16 +47,9 @@ pub struct Settings {
     pub window: Option<[i32; 5]>,
     /// Read an image from the clipboard when switching to the Detect tab.
     pub auto_clipboard: bool,
-    /// Show the setup wizard when the program starts.
-    #[serde(default = "yes")]
-    pub show_start_wizard: bool,
     /// Trusted-timestamp service used when the user ticks “申请可信时间戳”.
     #[serde(default = "default_tsa_url")]
     pub tsa_url: String,
-}
-
-fn yes() -> bool {
-    true
 }
 
 fn default_tsa_url() -> String {
@@ -152,7 +145,6 @@ impl Default for Settings {
             remember_window: true,
             window: None,
             auto_clipboard: false,
-            show_start_wizard: true,
             tsa_url: default_tsa_url(),
         }
     }
