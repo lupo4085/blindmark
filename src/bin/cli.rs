@@ -1,5 +1,5 @@
 use anyhow::{bail, Context, Result};
-use blindmark::jobs::{run_distribute, DistEvent, DistJob};
+use blindmark::jobs::{run_distribute, run_embed, DistEvent, DistJob, EmbedEvent, EmbedJob};
 use blindmark::recipients::{Book, GroupFilter};
 use blindmark::{keys, registry::Registry, wm, EmbedCheck};
 use clap::{Parser, Subcommand};
@@ -66,7 +66,7 @@ enum Cmd {
         #[command(subcommand)]
         cmd: RecCmd,
     },
-    /// Manage trusted timestamps of distribution batches
+    /// Manage trusted timestamps of batches (watermarking or distribution)
     Stamp {
         #[command(subcommand)]
         cmd: StampCmd,
@@ -177,27 +177,24 @@ fn file_name(path: &std::path::Path) -> String {
     path.file_name().map(|s| s.to_string_lossy().to_string()).unwrap_or_else(|| path.display().to_string())
 }
 
-/// Print the warning for a self-check result; returns (weak, unreadable) counts.
-fn warn_check(name: &str, check: EmbedCheck) -> (usize, usize) {
+/// Print the warning for a self-check result; returns 1 when the watermark is weak.
+fn warn_check(name: &str, check: EmbedCheck) -> usize {
     match check {
-        EmbedCheck::Ok => (0, 0),
+        EmbedCheck::Ok => 0,
         EmbedCheck::Weak => {
             eprintln!("warning: {name}: watermark is weak and may not survive re-compression or screenshots.");
-            (1, 0)
+            1
         }
-        EmbedCheck::Unreadable => {
-            eprintln!(
-                "warning: {name}: the picture is too flat (large pure black or white areas) to hold a watermark; it could not be read back. Consider not relying on it."
-            );
-            (0, 1)
-        }
+        EmbedCheck::Unreadable => 0,
     }
 }
 
-
-
 fn main() -> Result<()> {
-    match Cli::parse().cmd {
+    run(Cli::parse())
+}
+
+fn run(cli: Cli) -> Result<()> {
+    match cli.cmd {
         Cmd::Keygen { key } => {
             anyhow::ensure!(!key.exists(), "{} exists; refusing to overwrite", key.display());
             let k = keys::generate_key()?;
@@ -226,11 +223,13 @@ fn main() -> Result<()> {
         },
         Cmd::Embed { inputs, out, key, registry, strength, channel, jpeg, to, flat, timestamp, tsa } => {
             let k = read_key(&key)?;
-            let mut reg = Registry::open(&registry)?;
-            reg.check_key(&k)?;
             let t = std::time::Instant::now();
+            let tsa = timestamp.then(|| tsa.clone());
 
             if let Some(list) = to {
+                let mut reg = Registry::open(&registry)?;
+                reg.check_key(&k)?;
+                drop(reg);
                 let mut book = Book::open(&registry)?;
                 let mut recipient_ids = Vec::new();
                 for name in list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
@@ -245,25 +244,27 @@ fn main() -> Result<()> {
                     suffix: "_wm".into(),
                     strength,
                     jpeg_quality: jpeg.then_some(95),
-                    tsa: timestamp.then(|| tsa.clone()),
+                    tsa,
                 };
                 let cancel = std::sync::atomic::AtomicBool::new(false);
                 let mut rows = Vec::new();
-                let (mut weak, mut unreadable) = (0usize, 0usize);
+                let mut weak = 0usize;
+                let files = job.files.clone();
                 let summary = run_distribute(&job, &k, &registry, &cancel, &mut |ev| match ev {
                     DistEvent::Running { .. } | DistEvent::Stamping => {}
                     DistEvent::Item { recipient_id, recipient, result: Ok(ok), .. } => {
                         rows.push((ok, recipient_id, recipient))
                     }
-                    DistEvent::Item { result: Err(e), .. } => eprintln!("{}", e.message),
+                    DistEvent::Item { file_index, recipient, result: Err(e), .. } => {
+                        let input = files.get(file_index).cloned().unwrap_or_default();
+                        eprintln!("error: {} -> {recipient}: {}", input.display(), e.detail);
+                    }
                 })
                 .map_err(|e| anyhow::anyhow!("{}", e.message))?;
 
                 for (ok, recipient_id, recipient) in rows {
                     let name = file_name(&ok.output);
-                    let (w, u) = warn_check(&name, ok.check);
-                    weak += w;
-                    unreadable += u;
+                    weak += warn_check(&name, ok.check);
                     println!(
                         "{}",
                         serde_json::json!({
@@ -292,30 +293,66 @@ fn main() -> Result<()> {
                         },
                     })
                 );
-                if weak + unreadable > 0 {
-                    eprintln!("{weak} weak, {unreadable} unreadable");
+                if weak + summary.failed > 0 {
+                    eprintln!("{weak} weak, {} failed", summary.failed);
                 }
             } else {
-                let (mut weak, mut unreadable) = (0usize, 0usize);
-                for inp in inputs {
-                    let name = file_name(&inp);
-                    let stem = inp.file_stem().unwrap_or_default().to_string_lossy();
-                    let o = out.join(format!("{stem}_wm.{}", if jpeg { "jpg" } else { "png" }));
-                    match blindmark::embed_file(&inp, &o, &k, &mut reg, strength, channel.clone(), jpeg.then_some(95)) {
-                        Ok(r) => {
-                            let (w, u) = warn_check(&name, r.check);
-                            weak += w;
-                            unreadable += u;
-                            println!(
-                                "{}",
-                                serde_json::json!({"input": inp, "output": o, "id": format!("0x{:08x}", r.id), "psnr_db": (r.psnr * 100.0).round() / 100.0, "check": r.check, "sec": t.elapsed().as_secs_f64()})
-                            );
-                        }
-                        Err(e) => eprintln!("{}: {e:#}", inp.display()),
+                let job = EmbedJob {
+                    files: inputs,
+                    out_dir: Some(out),
+                    suffix: "_wm".into(),
+                    strength,
+                    jpeg_quality: jpeg.then_some(95),
+                    channel,
+                    tsa,
+                };
+                let files = job.files.clone();
+                let cancel = std::sync::atomic::AtomicBool::new(false);
+                let mut weak = 0usize;
+                let summary = run_embed(&job, &k, &registry, &cancel, &mut |ev| match ev {
+                    EmbedEvent::Running { .. } | EmbedEvent::Stamping => {}
+                    EmbedEvent::Item { index, result: Ok(ok) } => {
+                        let name = file_name(&ok.output);
+                        weak += warn_check(&name, ok.check);
+                        let input = files.get(index).cloned().unwrap_or_default();
+                        println!(
+                            "{}",
+                            serde_json::json!({
+                                "input": input,
+                                "output": ok.output,
+                                "id": format!("0x{:08x}", ok.id),
+                                "psnr_db": (ok.psnr * 100.0).round() / 100.0,
+                                "check": ok.check,
+                                "sha256_file": ok.sha256_file,
+                                "sec": t.elapsed().as_secs_f64(),
+                            })
+                        );
                     }
+                    EmbedEvent::Item { index, result: Err(e) } => {
+                        let input = files.get(index).cloned().unwrap_or_default();
+                        eprintln!("error: {}: {}", input.display(), e.detail);
+                    }
+                })
+                .map_err(|e| anyhow::anyhow!("{}", e.message))?;
+
+                if let Some(Err(e)) = &summary.stamp {
+                    eprintln!("{}", e.message);
                 }
-                if weak + unreadable > 0 {
-                    eprintln!("{weak} weak, {unreadable} unreadable");
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "batch_id": summary.batch_id,
+                        "ok": summary.ok,
+                        "failed": summary.failed,
+                        "stamp": match &summary.stamp {
+                            None => serde_json::Value::Null,
+                            Some(Ok(_)) => serde_json::json!("ok"),
+                            Some(Err(_)) => serde_json::json!("failed"),
+                        },
+                    })
+                );
+                if weak + summary.failed > 0 {
+                    eprintln!("{weak} weak, {} failed", summary.failed);
                 }
             }
         }
@@ -429,5 +466,73 @@ fn stamp_error_kind(error: &Option<blindmark::timestamp::StampError>) -> &'stati
         Some(Mismatch { .. }) => "mismatch",
         Some(Malformed { .. }) => "malformed",
         None => "-",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmp(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("blindmark-cli-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// 512×512 procedural texture (never a flat colour), as PNG.
+    fn textured_png(path: &std::path::Path) {
+        let (w, h) = (512usize, 512usize);
+        let mut s: u32 = 0x1234_5678;
+        let mut data = vec![0u8; w * h * 3];
+        for y in 0..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let n = (s >> 24) as f32 / 255.0 * 30.0;
+                let v = 120.0 + 50.0 * ((x as f32 * 0.05).sin() * (y as f32 * 0.03).cos()) + n;
+                let i = (y * w + x) * 3;
+                for c in 0..3 {
+                    data[i + c] = (v + c as f32 * 10.0).clamp(0.0, 255.0) as u8;
+                }
+            }
+        }
+        image::save_buffer(path, &data, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
+    }
+
+    /// The second run must not overwrite the first output.
+    #[test]
+    fn embedding_twice_keeps_both_outputs() {
+        let base = tmp("twice");
+        let input = base.join("a.png");
+        textured_png(&input);
+        let key_path = base.join("blindmark.key");
+        let k = keys::generate_key().unwrap();
+        std::fs::write(&key_path, hex::encode(k) + "\n").unwrap();
+        let out = base.join("out");
+        let embed = || Cmd::Embed {
+            inputs: vec![input.clone()],
+            out: out.clone(),
+            key: key_path.clone(),
+            registry: base.join("registry"),
+            strength: wm::DEFAULT_STRENGTH,
+            channel: None,
+            jpeg: false,
+            to: None,
+            flat: false,
+            timestamp: false,
+            tsa: blindmark::timestamp::DEFAULT_TSA.into(),
+        };
+
+        run(Cli { cmd: embed() }).unwrap();
+        let first = out.join("a_wm.png");
+        assert!(first.exists(), "the first output must be a_wm.png");
+        let before = std::fs::read(&first).unwrap();
+
+        run(Cli { cmd: embed() }).unwrap();
+        let second = out.join("a_wm2.png");
+        assert!(second.exists(), "the second output must get its own name");
+        assert_ne!(before, std::fs::read(&second).unwrap(), "the two outputs must differ");
+        assert_eq!(before, std::fs::read(&first).unwrap(), "the first output must not change");
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

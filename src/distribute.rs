@@ -163,7 +163,17 @@ fn make_copy(
     let path = unique_output_path(&dir, Path::new(&format!("{stem_out}.png")), &o.suffix, o.jpeg_quality.is_some());
     save_image(&marked, &path, o.jpeg_quality)?;
     let sha256_file = sha256_of_file(&path)?;
-    let check = check_embedded(&path, key, id).unwrap_or(EmbedCheck::Unreadable);
+    let check = match check_embedded(&path, key, id) {
+        Ok(check) => check,
+        Err(e) => {
+            let _ = std::fs::remove_file(&path);
+            return Err(e.context("could not read back the saved file"));
+        }
+    };
+    if check == EmbedCheck::Unreadable {
+        let _ = std::fs::remove_file(&path);
+        return Err(anyhow::Error::new(crate::WatermarkNotReadable { file: file_name(file) }));
+    }
 
     let meta = CopyMeta {
         recipient_id: Some(target.id.clone()),
@@ -225,13 +235,19 @@ pub fn distribute(
                 continue 'files;
             }
         };
+        let mut flat: Option<String> = None;
         for (index, target) in targets.iter().enumerate() {
             if cancel.load(Ordering::SeqCst) {
                 out.cancelled = true;
                 break 'files;
             }
             on(DistProgress::Start { file_index, target });
-            let result = make_copy(file_index, file, &original, target, &names[index], key, o, reg);
+            let result = match &flat {
+                // Whether a watermark fits is a property of the picture, not of the recipient:
+                // once one copy came back unreadable, the rest fail the same way without work.
+                Some(name) => Err(anyhow::Error::new(crate::WatermarkNotReadable { file: name.clone() })),
+                None => make_copy(file_index, file, &original, target, &names[index], key, o, reg),
+            };
             on(DistProgress::Done { file_index, target, result: &result });
             match result {
                 Ok(copy) => {
@@ -245,20 +261,19 @@ pub fn distribute(
                     });
                     out.copies.push(copy);
                 }
-                Err(e) => out.failed.push((file_index, target.id.clone(), e)),
+                Err(e) => {
+                    if flat.is_none() && e.downcast_ref::<crate::WatermarkNotReadable>().is_some() {
+                        flat = Some(file_name(file));
+                    }
+                    out.failed.push((file_index, target.id.clone(), e));
+                }
             }
         }
     }
 
     if let Some(url) = &o.tsa {
         if !out.copies.is_empty() {
-            let manifest = Manifest {
-                format: timestamp::MANIFEST_FORMAT.to_string(),
-                batch_id: o.batch_id.clone(),
-                created_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
-                key_fingerprint: crate::keys::fingerprint(key),
-                copies: manifest_copies,
-            };
+            let manifest = Manifest::new(&o.batch_id, key, manifest_copies);
             on(DistProgress::Stamping);
             out.stamp = Some(timestamp::stamp_batch(&reg.dir, &manifest, url));
         }
@@ -298,6 +313,25 @@ mod tests {
 
     fn key() -> [u8; 32] {
         crate::keys::generate_key().unwrap()
+    }
+
+    /// 720×1600, almost all black. The bottom 60 rows carry noise so `too_flat` does not
+    /// reject the picture before the watermark is considered.
+    fn black_screenshot(path: &Path) {
+        let (w, h) = (720usize, 1600usize);
+        let mut data = vec![0u8; w * h * 3];
+        let mut s: u32 = 0x9e37_79b9;
+        for y in (h - 60)..h {
+            for x in 0..w {
+                s = s.wrapping_mul(1664525).wrapping_add(1013904223);
+                let v = (s >> 24) as u8;
+                let i = (y * w + x) * 3;
+                data[i] = v;
+                data[i + 1] = v;
+                data[i + 2] = v;
+            }
+        }
+        image::save_buffer(path, &data, w as u32, h as u32, image::ColorType::Rgb8).unwrap();
     }
 
     fn target(id: &str, name: &str) -> Target {
@@ -382,6 +416,70 @@ mod tests {
         let mut ids: Vec<&str> = outcome.failed.iter().map(|(_, id, _)| id.as_str()).collect();
         ids.sort();
         assert_eq!(ids, vec!["r_00000001", "r_00000002", "r_00000003"]);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// A picture that cannot hold a watermark fails every recipient and leaves no file behind.
+    #[test]
+    fn flat_picture_fails_every_recipient_and_saves_nothing() {
+        let base = tmp("flat");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let black = input.join("black.png");
+        black_screenshot(&black);
+        let targets = vec![target("r_00000001", "张三"), target("r_00000002", "李四"), target("r_00000003", "王五")];
+        let regdir = base.join("registry");
+        let mut reg = Registry::open(&regdir).unwrap();
+        let root = base.join("out");
+        let o = opts(root.clone(), "b_test_flat");
+        let cancel = AtomicBool::new(false);
+        let mut starts = 0;
+        let mut dones = 0;
+        let outcome = distribute(&[black], &targets, &key(), &mut reg, &o, &cancel, &mut |p| match p {
+            DistProgress::Start { .. } => starts += 1,
+            DistProgress::Done { .. } => dones += 1,
+            DistProgress::Stamping => {}
+        });
+
+        assert!(outcome.copies.is_empty());
+        assert_eq!(outcome.failed.len(), 3);
+        assert!(
+            outcome.failed.iter().all(|(_, _, e)| e.downcast_ref::<crate::WatermarkNotReadable>().is_some()),
+            "every recipient must get WatermarkNotReadable"
+        );
+        assert_eq!((starts, dones), (3, 3), "Start/Done still fire for the skipped recipients");
+        assert!(files_under(&root).is_empty(), "no file of the flat picture may stay on disk");
+        assert_eq!(reg.entries.len(), 0);
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    /// The flat picture fails; the textured one still reaches all three recipients.
+    #[test]
+    fn flat_and_textured_picture_in_one_batch() {
+        let base = tmp("flat-and-good");
+        let input = base.join("in");
+        std::fs::create_dir_all(&input).unwrap();
+        let black = input.join("black.png");
+        black_screenshot(&black);
+        let good = input.join("good.png");
+        textured_png(&good);
+        let targets = vec![target("r_00000001", "张三"), target("r_00000002", "李四"), target("r_00000003", "王五")];
+        let regdir = base.join("registry");
+        let mut reg = Registry::open(&regdir).unwrap();
+        let root = base.join("out");
+        let o = opts(root.clone(), "b_test_mixed");
+        let cancel = AtomicBool::new(false);
+        let outcome = distribute(&[black, good], &targets, &key(), &mut reg, &o, &cancel, &mut |_| {});
+
+        assert_eq!(outcome.copies.len(), 3);
+        assert_eq!(outcome.failed.len(), 3);
+        assert!(outcome.failed.iter().all(|(index, _, e)| *index == 0
+            && e.downcast_ref::<crate::WatermarkNotReadable>().is_some()));
+        assert_eq!(reg.entries.len(), 3);
+        let names: Vec<String> =
+            files_under(&root).iter().map(|p| p.file_name().unwrap().to_string_lossy().to_string()).collect();
+        assert_eq!(names.len(), 3);
+        assert!(names.iter().all(|n| n.starts_with("good")), "{names:?}");
         let _ = std::fs::remove_dir_all(&base);
     }
 

@@ -10,6 +10,7 @@ function Invoke-Step([string]$name, [scriptblock]$cmd) {
 
 Invoke-Step 'cargo test --release --lib' { cargo test --release --lib }
 Invoke-Step 'cargo test --release --bin blindmark' { cargo test --release --bin blindmark }
+Invoke-Step 'cargo test --release --bin blindmark-cli' { cargo test --release --bin blindmark-cli }
 Invoke-Step 'cargo test --release --test golden' { cargo test --release --test golden }
 Invoke-Step 'cargo build --release --bins' { cargo build --release --bins }
 

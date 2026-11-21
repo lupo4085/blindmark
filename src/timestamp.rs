@@ -1,4 +1,4 @@
-//! Trusted timestamps (RFC 3161) for a distribution batch.
+//! Trusted timestamps (RFC 3161) for a batch of copies, watermarking or distribution.
 //!
 //! A batch manifest is written next to the registry, hashed, and that hash (with a random
 //! nonce) is sent to a Time-Stamp Authority. The signed reply proves that the manifest — and
@@ -25,8 +25,8 @@ pub const DEFAULT_TSA: &str = "https://freetsa.org/tsr";
 /// Written once into `timestamps/README.txt`. The OpenSSL command is meant to be copied
 /// verbatim; the two certificate files are the user's business.
 const README: &str = "\
-每个子文件夹是一批分发的副本。
-manifest.json   这批副本的清单（编号、接收人、文件的 SHA-256）
+每个子文件夹是一批加水印或分发的副本。
+manifest.json   这批副本的清单（编号、接收人（分发时才有）、文件的 SHA-256）
 response.tsr    时间戳服务签名的回执，证明清单在 tsa.json 里的 gen_time_utc 之前就已存在
 
 独立核验（需要 OpenSSL，以及时间戳服务的 CA 证书和 TSA 证书）：
@@ -56,6 +56,20 @@ pub struct Manifest {
     pub created_utc: String,
     pub key_fingerprint: String,
     pub copies: Vec<ManifestCopy>,
+}
+
+impl Manifest {
+    /// The manifest of one batch. Every batch-producing job builds it here, so watermarking
+    /// and distribution write the same fields.
+    pub fn new(batch_id: &str, key: &[u8], copies: Vec<ManifestCopy>) -> Manifest {
+        Manifest {
+            format: MANIFEST_FORMAT.to_string(),
+            batch_id: batch_id.to_string(),
+            created_utc: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+            key_fingerprint: crate::keys::fingerprint(key),
+            copies,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
