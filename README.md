@@ -72,7 +72,7 @@ BlindMark takes a different approach · BlindMark 的做法是：
 | **Registry**<br>登记表 | Records the original, note, time and thumbnail for each ID; searchable, exports to CSV.<br>记录每个编号对应的原图、备注、时间和缩略图，可搜索、导出 CSV。 |
 | **Catches transplanted marks**<br>防“搬运”误判 | Compares the picture with the registered thumbnail to spot a mark moved onto another image.<br>检出编号后，把画面和登记的缩略图比对，发现有人把水印移到了别的图上。 |
 | **One-click evidence export**<br>一键导出证据 | Report, SHA-256 of the suspect file, registered thumbnail and registry entry in one folder.<br>检测报告、可疑文件的 SHA-256、登记缩略图和登记记录打包到一个文件夹。 |
-| **Getting-started wizard**<br>新手向导 | Walks you through creating a key, choosing a registry, watermarking and checking. Press F1 any time.<br>带你完成创建密钥、选择登记表、加水印、检查图片，随时按 F1 打开。 |
+| **First-run setup**<br>首次设置 | Walks you through creating a key, choosing where to keep the registry and backing up your key. Opens automatically when there is no key, or from Tools → First-run setup.<br>带你创建密钥、选择登记表位置并备份密钥。没有密钥时自动打开，也可以从“工具 → 首次设置…”打开。 |
 | **Native app**<br>原生程序 | Native Win32 UI on Windows (high-DPI aware); a single-binary CLI on all three platforms.<br>Windows 是原生 Win32 界面（支持高 DPI），三个平台都有单文件命令行版。 |
 | **Python reference**<br>Python 参考实现 | Byte-for-byte compatible with the Rust build, with attack simulations and benchmark scripts.<br>和 Rust 版逐字节互通，自带攻击模拟和评测脚本。 |
 
@@ -212,7 +212,7 @@ A classic Win32 window with a menu bar, four tabs and a status bar (status · ke
 | Picture matches, no watermark read<br>画面和登记的图一致，但没有读出水印 | Processed too heavily, or the unwatermarked original leaked.<br>处理得太狠，或者流出的是没加水印的原图。 |
 | No watermark found<br>没有找到你的水印 | This does **not** prove the image isn't yours.<br>这**不能**证明图不是你的。 |
 
-**Shortcuts · 快捷键：** F1 getting started · 开始使用（向导）；Ctrl+O add images · 添加图片；Ctrl+D detect · 检测图片；Ctrl+V detect from clipboard · 从剪贴板检测；Del remove selected · 移除所选；F5 refresh registry · 刷新登记表；Ctrl+1…4 switch tabs · 切换选项卡。
+**Shortcuts · 快捷键：** Ctrl+O add images · 添加图片；Ctrl+D detect · 检测图片；Ctrl+V detect from clipboard · 从剪贴板检测；Del remove selected · 移除所选；F5 refresh registry · 刷新登记表；Ctrl+1…4 switch tabs · 切换选项卡。
 
 ## Command line · 命令行
 
@@ -342,9 +342,9 @@ src/wm.rs         embedding and standard detection · 嵌入与常规检测
 src/affine.rs     affine sync (rotation, mirroring, shear) · 仿射同步（旋转、翻转、拉伸）
 src/features.rs   feature matching and perspective estimation (experimental) · 特征点匹配与透视估计（实验代码）
 src/registry.rs   registry, image I/O, picture consistency · 登记表、图片读写、画面一致性检查
-src/jobs.rs       background jobs shared by app and wizard · 加水印和检测的后台任务
+src/jobs.rs       background jobs shared by the app and the command line · 加水印、分发和检测的后台任务
 src/imgproc.rs    filtering, resizing, FFT · 滤波、缩放、FFT
-src/win/          Win32 desktop app and wizard · Win32 图形界面和向导
+src/win/          Win32 desktop app · Win32 图形界面
 src/bin/cli.rs    command line · 命令行
 python/           reference implementation, attacks, benchmarks · Python 参考实现、攻击模拟、评测脚本
 docs/             architecture, UI specs, task cards · 架构、界面规格、任务卡
