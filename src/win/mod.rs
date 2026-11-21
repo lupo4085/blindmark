@@ -679,8 +679,8 @@ impl App {
         }
         // W-COMMON: reload after applying the outcome, never before it.
         self.load_key_and_registry(false);
-        self.select_tab(TAB_EMBED);
         if settings_changed {
+            self.select_tab(TAB_EMBED);
             self.set_status("设置已保存。");
         }
         if let Some(e) = save_error {
